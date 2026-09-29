@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.a
+*.so
+tundra-ip
+/build/
+
+# Compilation
+/out/
+compile_commands.json
+/scripts/
+
+# Editor/OS cruft
+*.swp
+*~
+.DS_Store
+
+# clang dir
+.cache/
+
+# Learning process
+/learn/

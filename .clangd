@@ -1,0 +1,8 @@
+CompileFlags:
+  Compiler: gcc
+  Add:
+    - -xc
+    - -std=c11
+    - -D_GNU_SOURCE
+    - -Wall
+    - -Wextra
