@@ -1,5 +1,5 @@
-#ifndef TUNDRA_DHCPC_RAWSOCK_H
-#define TUNDRA_DHCPC_RAWSOCK_H
+#ifndef TUNDRA_RAWSOCK_H
+#define TUNDRA_RAWSOCK_H
 
 #include <linux/if_ether.h>
 #include <stddef.h>
@@ -8,7 +8,7 @@
 struct rawsock {
 	int fd;
 	int ifindex;
-	uint8_t mac[ETH_ALEN];
+	unsigned char mac[ETH_ALEN];
 };
 
 int rawsock_open(struct rawsock *rs, const char *ifname);
