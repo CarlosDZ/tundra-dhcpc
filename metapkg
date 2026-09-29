@@ -1,0 +1,6 @@
+name=tundra-dhcpc
+author=CarlosDZ
+version=0.1_1
+v_date=
+license=GPL-3.0-only
+description=Minimal DHCPv4 client for Tundra OS
