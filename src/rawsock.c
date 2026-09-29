@@ -57,17 +57,14 @@ static uint16_t inet_csum(const void *data, size_t len) {
 static int parse_datagram(const uint8_t *buf, size_t n, const uint8_t **payload,
                           size_t *len) {
 	struct ipv4_hdr ip;
-	struct udp_hdr udp;
-	size_t ihl, tot, ulen;
-
-	if (n < sizeof ip)
+	if (n < sizeof(ip))
 		return -1;
-	memcpy(&ip, buf, sizeof ip);
+	memcpy(&ip, buf, sizeof(ip));
 
 	if ((ip.ver_ihl >> 4) != 4)
 		return -1;
-	ihl = (size_t)(ip.ver_ihl & 0x0f) * 4;
-	if (ihl < sizeof ip || ihl > n)
+	size_t ihl = (size_t)(ip.ver_ihl & 0x0f) * 4;
+	if (ihl < sizeof(ip) || ihl > n)
 		return -1;
 	if (inet_csum(buf, ihl) != 0)
 		return -1;
@@ -75,31 +72,29 @@ static int parse_datagram(const uint8_t *buf, size_t n, const uint8_t **payload,
 		return -1;
 	if (ntohs(ip.frag_off) & 0x3fff)
 		return -1;
-	tot = ntohs(ip.tot_len);
-	if (tot > n || tot < ihl + sizeof udp)
+
+	struct udp_hdr udp;
+	size_t tot = ntohs(ip.tot_len);
+	if (tot > n || tot < ihl + sizeof(udp))
 		return -1;
 
-	memcpy(&udp, buf + ihl, sizeof udp);
+	memcpy(&udp, buf + ihl, sizeof(udp));
 	if (ntohs(udp.sport) != DHCP_SERVER_PORT ||
 	    ntohs(udp.dport) != DHCP_CLIENT_PORT)
 		return -1;
-	ulen = ntohs(udp.len);
-	if (ulen < sizeof udp || ihl + ulen > tot)
+	size_t ulen = ntohs(udp.len);
+	if (ulen < sizeof(udp) || ihl + ulen > tot)
 		return -1;
 
-	*payload = buf + ihl + sizeof udp;
-	*len = ulen - sizeof udp;
+	*payload = buf + ihl + sizeof(udp);
+	*len = ulen - sizeof(udp);
 	return 0;
 }
 
 int rawsock_open(struct rawsock *rs, const char *ifname) {
-	struct sockaddr_ll sll;
-	struct ifreq ifr;
-	unsigned int idx;
-
 	rs->fd = -1;
 
-	idx = if_nametoindex(ifname);
+	unsigned int idx = if_nametoindex(ifname);
 	if (!idx) {
 		fprintf(stderr, "%s: %s\n", ifname, strerror(errno));
 		return -1;
@@ -112,27 +107,27 @@ int rawsock_open(struct rawsock *rs, const char *ifname) {
 		return -1;
 	}
 
-	memset(&sll, 0, sizeof sll);
+	struct sockaddr_ll sll;
+	memset(&sll, 0, sizeof(sll));
 	sll.sll_family = AF_PACKET;
 	sll.sll_protocol = htons(ETH_P_IP);
 	sll.sll_ifindex = rs->ifindex;
-	if (bind(rs->fd, (struct sockaddr *)&sll, sizeof sll) < 0) {
+	if (bind(rs->fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
 		perror("bind error");
-		goto fail;
+		rawsock_close(rs);
+		return -1;
 	}
 
-	memset(&ifr, 0, sizeof ifr);
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
 	if (ioctl(rs->fd, SIOCGIFHWADDR, &ifr) < 0) {
 		perror("SIOCGIFHWADDR error");
-		goto fail;
+		rawsock_close(rs);
+		return -1;
 	}
 	memcpy(rs->mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
 	return 0;
-
-fail:
-	rawsock_close(rs);
-	return -1;
 }
 
 void rawsock_close(struct rawsock *rs) {
@@ -143,45 +138,43 @@ void rawsock_close(struct rawsock *rs) {
 }
 
 int rawsock_send(const struct rawsock *rs, const void *payload, size_t len) {
-	uint8_t frame[sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr) +
-	              UDP_MAX_PAYLOAD];
-	struct ipv4_hdr ip;
-	struct udp_hdr udp;
-	struct sockaddr_ll dst;
-	size_t total = sizeof ip + sizeof udp + len;
-
 	if (len > UDP_MAX_PAYLOAD) {
-		fprintf(stderr, "rawsock_send: payload too large (%zu bytes)\n", len);
+		fprintf(stderr, "payload too large: %zu bytes\n", len);
 		return -1;
 	}
 
-	memset(&udp, 0, sizeof udp);
+	struct udp_hdr udp;
+	memset(&udp, 0, sizeof(udp));
 	udp.sport = htons(DHCP_CLIENT_PORT);
 	udp.dport = htons(DHCP_SERVER_PORT);
-	udp.len = htons((uint16_t)(sizeof udp + len));
-	udp.csum = 0;
+	udp.len = htons((uint16_t)(sizeof(udp) + len));
 
-	memset(&ip, 0, sizeof ip);
+	struct ipv4_hdr ip;
+	size_t total = sizeof(ip) + sizeof(udp) + len;
+	memset(&ip, 0, sizeof(ip));
 	ip.ver_ihl = 0x45;
 	ip.tot_len = htons((uint16_t)total);
 	ip.ttl = 64;
 	ip.proto = IPPROTO_UDP;
 	ip.saddr = htonl(INADDR_ANY);
 	ip.daddr = htonl(INADDR_BROADCAST);
-	ip.csum = inet_csum(&ip, sizeof ip);
+	ip.csum = inet_csum(&ip, sizeof(ip));
 
-	memcpy(frame, &ip, sizeof ip);
-	memcpy(frame + sizeof ip, &udp, sizeof udp);
-	memcpy(frame + sizeof ip + sizeof udp, payload, len);
+	uint8_t frame[sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr) +
+	              UDP_MAX_PAYLOAD];
+	memcpy(frame, &ip, sizeof(ip));
+	memcpy(frame + sizeof(ip), &udp, sizeof(udp));
+	memcpy(frame + sizeof(ip) + sizeof(udp), payload, len);
 
-	memset(&dst, 0, sizeof dst);
+	struct sockaddr_ll dst;
+	memset(&dst, 0, sizeof(dst));
 	dst.sll_family = AF_PACKET;
 	dst.sll_protocol = htons(ETH_P_IP);
 	dst.sll_ifindex = rs->ifindex;
 	dst.sll_halen = ETH_ALEN;
 	memset(dst.sll_addr, 0xff, ETH_ALEN);
 
-	if (sendto(rs->fd, frame, total, 0, (struct sockaddr *)&dst, sizeof dst) <
+	if (sendto(rs->fd, frame, total, 0, (struct sockaddr *)&dst, sizeof(dst)) <
 	    0) {
 		perror("sendto error");
 		return -1;
@@ -192,10 +185,7 @@ int rawsock_send(const struct rawsock *rs, const void *payload, size_t len) {
 int rawsock_recv(const struct rawsock *rs, uint8_t *buf, size_t cap,
                  int timeout_ms, const uint8_t **payload, size_t *len) {
 	struct pollfd pfd = {.fd = rs->fd, .events = POLLIN};
-	ssize_t n;
-	int r;
-
-	r = poll(&pfd, 1, timeout_ms);
+	int r = poll(&pfd, 1, timeout_ms);
 	if (r < 0) {
 		if (errno == EINTR)
 			return 0;
@@ -205,7 +195,7 @@ int rawsock_recv(const struct rawsock *rs, uint8_t *buf, size_t cap,
 	if (r == 0)
 		return 0;
 
-	n = recv(rs->fd, buf, cap, 0);
+	ssize_t n = recv(rs->fd, buf, cap, 0);
 	if (n < 0) {
 		if (errno == EINTR)
 			return 0;

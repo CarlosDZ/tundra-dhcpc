@@ -1,5 +1,5 @@
-#ifndef TUNDRA_DHCPC_DHCP_H
-#define TUNDRA_DHCPC_DHCP_H
+#ifndef TUNDRA_DHCP_H
+#define TUNDRA_DHCP_H
 
 #include <linux/if_ether.h>
 #include <stddef.h>
@@ -15,6 +15,7 @@ enum {
 	DHCPNAK = 6,
 };
 
+/* All addresses and the lease time stay in network byte order, as received. */
 struct dhcp_info {
 	uint8_t type;
 	uint32_t yiaddr;
@@ -26,9 +27,9 @@ struct dhcp_info {
 };
 
 size_t dhcp_build_discover(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                           const uint8_t mac[ETH_ALEN]);
+                           const unsigned char mac[ETH_ALEN]);
 size_t dhcp_build_request(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                          const uint8_t mac[ETH_ALEN], uint32_t addr,
+                          const unsigned char mac[ETH_ALEN], uint32_t addr,
                           uint32_t server);
 
 int dhcp_parse_reply(const uint8_t *msg, size_t len, uint32_t xid,

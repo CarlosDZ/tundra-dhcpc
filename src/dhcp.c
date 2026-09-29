@@ -58,10 +58,8 @@ static uint8_t *opt_put(uint8_t *o, uint8_t code, uint8_t len,
 static const uint8_t *opt_find(const uint8_t *opts, size_t len, uint8_t code,
                                uint8_t *olen) {
 	size_t i = 0;
-
 	while (i < len) {
 		uint8_t c = opts[i];
-
 		if (c == OPT_END)
 			break;
 		if (c == OPT_PAD) {
@@ -84,17 +82,15 @@ static const uint8_t *opt_find(const uint8_t *opts, size_t len, uint8_t code,
 
 static void opt_get_addr(const uint8_t *opts, size_t olen, uint8_t code,
                          uint32_t *out) {
-	const uint8_t *v;
 	uint8_t l;
-
-	v = opt_find(opts, olen, code, &l);
+	const uint8_t *v = opt_find(opts, olen, code, &l);
 	if (v && l >= 4)
 		memcpy(out, v, 4);
 }
 
 static uint8_t *msg_init(struct dhcp_msg *m, uint32_t xid,
-                         const uint8_t mac[ETH_ALEN], uint8_t type) {
-	memset(m, 0, sizeof *m);
+                         const unsigned char mac[ETH_ALEN], uint8_t type) {
+	memset(m, 0, sizeof(*m));
 	m->op = BOOTREQUEST;
 	m->htype = 1;
 	m->hlen = ETH_ALEN;
@@ -105,52 +101,48 @@ static uint8_t *msg_init(struct dhcp_msg *m, uint32_t xid,
 }
 
 size_t dhcp_build_discover(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                           const uint8_t mac[ETH_ALEN]) {
+                           const unsigned char mac[ETH_ALEN]) {
 	struct dhcp_msg m;
 	uint8_t *o = msg_init(&m, xid, mac, DHCPDISCOVER);
-
-	o = opt_put(o, OPT_PARAM_REQ, sizeof param_req, param_req);
+	o = opt_put(o, OPT_PARAM_REQ, sizeof(param_req), param_req);
 	*o = OPT_END;
 
-	memcpy(buf, &m, sizeof m);
-	return sizeof m;
+	memcpy(buf, &m, sizeof(m));
+	return sizeof(m);
 }
 
 size_t dhcp_build_request(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                          const uint8_t mac[ETH_ALEN], uint32_t addr,
+                          const unsigned char mac[ETH_ALEN], uint32_t addr,
                           uint32_t server) {
 	struct dhcp_msg m;
 	uint8_t *o = msg_init(&m, xid, mac, DHCPREQUEST);
-
 	o = opt_put(o, OPT_REQUESTED_IP, 4, &addr);
 	o = opt_put(o, OPT_SERVER_ID, 4, &server);
-	o = opt_put(o, OPT_PARAM_REQ, sizeof param_req, param_req);
+	o = opt_put(o, OPT_PARAM_REQ, sizeof(param_req), param_req);
 	*o = OPT_END;
 
-	memcpy(buf, &m, sizeof m);
-	return sizeof m;
+	memcpy(buf, &m, sizeof(m));
+	return sizeof(m);
 }
 
 int dhcp_parse_reply(const uint8_t *msg, size_t len, uint32_t xid,
                      struct dhcp_info *info) {
-	struct dhcp_msg m;
-	const uint8_t *opts, *t;
-	size_t olen;
-	uint8_t l;
-
 	if (len < DHCP_FIXED_LEN)
 		return -1;
+
+	struct dhcp_msg m;
 	memcpy(&m, msg, DHCP_FIXED_LEN);
 	if (m.op != BOOTREPLY || m.xid != xid || m.magic != htonl(DHCP_MAGIC))
 		return -1;
 
-	opts = msg + DHCP_FIXED_LEN;
-	olen = len - DHCP_FIXED_LEN;
-	t = opt_find(opts, olen, OPT_MSG_TYPE, &l);
+	const uint8_t *opts = msg + DHCP_FIXED_LEN;
+	size_t olen = len - DHCP_FIXED_LEN;
+	uint8_t l;
+	const uint8_t *t = opt_find(opts, olen, OPT_MSG_TYPE, &l);
 	if (!t || l != 1)
 		return -1;
 
-	memset(info, 0, sizeof *info);
+	memset(info, 0, sizeof(*info));
 	info->type = t[0];
 	info->yiaddr = m.yiaddr;
 	opt_get_addr(opts, olen, OPT_SERVER_ID, &info->server_id);
