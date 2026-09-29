@@ -1,0 +1,17 @@
+*.o
+*.a
+*.so
+tundra-ip
+/build/
+
+/out/
+compile_commands.json
+/scripts/
+
+*.swp
+*~
+.DS_Store
+
+.cache/
+
+/learn/
