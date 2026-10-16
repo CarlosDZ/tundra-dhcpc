@@ -18,6 +18,8 @@ enum {
 	OPT_MSG_TYPE = 53,
 	OPT_SERVER_ID = 54,
 	OPT_PARAM_REQ = 55,
+	OPT_RENEWAL_TIME = 58,
+	OPT_REBINDING_TIME = 59,
 	OPT_END = 255,
 };
 
@@ -117,7 +119,33 @@ size_t dhcp_build_request(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
 	struct dhcp_msg m;
 	uint8_t *o = msg_init(&m, xid, mac, DHCPREQUEST);
 	o = opt_put(o, OPT_REQUESTED_IP, 4, &addr);
+	if (server)
+		o = opt_put(o, OPT_SERVER_ID, 4, &server);
+	o = opt_put(o, OPT_PARAM_REQ, sizeof(param_req), param_req);
+	*o = OPT_END;
+
+	memcpy(buf, &m, sizeof(m));
+	return sizeof(m);
+}
+
+size_t dhcp_build_decline(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
+                          const unsigned char mac[ETH_ALEN], uint32_t addr,
+                          uint32_t server) {
+	struct dhcp_msg m;
+	uint8_t *o = msg_init(&m, xid, mac, DHCPDECLINE);
+	o = opt_put(o, OPT_REQUESTED_IP, 4, &addr);
 	o = opt_put(o, OPT_SERVER_ID, 4, &server);
+	*o = OPT_END;
+
+	memcpy(buf, &m, sizeof(m));
+	return sizeof(m);
+}
+
+size_t dhcp_build_renew(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
+                        const unsigned char mac[ETH_ALEN], uint32_t ciaddr) {
+	struct dhcp_msg m;
+	uint8_t *o = msg_init(&m, xid, mac, DHCPREQUEST);
+	m.ciaddr = ciaddr;
 	o = opt_put(o, OPT_PARAM_REQ, sizeof(param_req), param_req);
 	*o = OPT_END;
 
@@ -150,5 +178,7 @@ int dhcp_parse_reply(const uint8_t *msg, size_t len, uint32_t xid,
 	opt_get_addr(opts, olen, OPT_ROUTER, &info->router);
 	opt_get_addr(opts, olen, OPT_DNS, &info->dns);
 	opt_get_addr(opts, olen, OPT_LEASE_TIME, &info->lease);
+	opt_get_addr(opts, olen, OPT_RENEWAL_TIME, &info->t1);
+	opt_get_addr(opts, olen, OPT_REBINDING_TIME, &info->t2);
 	return 0;
 }
