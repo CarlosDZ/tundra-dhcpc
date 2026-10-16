@@ -16,7 +16,6 @@ void rawsock_close(struct rawsock *rs);
 
 int rawsock_send(const struct rawsock *rs, const void *payload, size_t len);
 
-/* 1: valid DHCP datagram in *payload, 0: nothing useful yet, -1: error. */
 int rawsock_recv(const struct rawsock *rs, uint8_t *buf, size_t cap,
                  int timeout_ms, const uint8_t **payload, size_t *len);
 

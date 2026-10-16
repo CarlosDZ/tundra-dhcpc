@@ -1,136 +1,91 @@
-#include "dhcp.h"
-#include "rawsock.h"
+#include "client.h"
 
-#include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
-#include <time.h>
 
-#define REPLY_TIMEOUT_MS 10000
+static int parse_uint(const char *s, unsigned int *out) {
+	if (s[0] < '0' || s[0] > '9')
+		return -1;
 
-static long elapsed_ms(const struct timespec *t0) {
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	return (now.tv_sec - t0->tv_sec) * 1000 +
-	       (now.tv_nsec - t0->tv_nsec) / 1000000;
-}
+	char *end;
+	errno = 0;
+	unsigned long v = strtoul(s, &end, 10);
+	if (errno || *end != '\0' || v > UINT_MAX)
+		return -1;
 
-/* 1: matching reply in *info, 0: timeout, -1: error. */
-static int wait_reply(const struct rawsock *rs, uint32_t xid, unsigned int want,
-                      uint32_t server, struct dhcp_info *info) {
-	uint8_t buf[2048];
-	struct timespec t0;
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-
-	for (;;) {
-		long left = REPLY_TIMEOUT_MS - elapsed_ms(&t0);
-		if (left <= 0)
-			return 0;
-
-		const uint8_t *msg;
-		size_t len;
-		int r = rawsock_recv(rs, buf, sizeof(buf), (int)left, &msg, &len);
-		if (r < 0)
-			return -1;
-		if (r == 0)
-			continue;
-
-		if (dhcp_parse_reply(msg, len, xid, info) < 0)
-			continue;
-		if (info->type > 31 || !(want & (1u << info->type)))
-			continue;
-		if (server && info->server_id != server)
-			continue;
-		return 1;
-	}
-}
-
-static void print_ip(const char *label, uint32_t a) {
-	char s[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &a, s, sizeof(s));
-	printf("  %-8s %s\n", label, s);
-}
-
-static void print_info(const char *what, const struct dhcp_info *info) {
-	printf("%s received\n", what);
-	print_ip("address", info->yiaddr);
-	if (info->server_id)
-		print_ip("server", info->server_id);
-	if (info->mask)
-		printf("  %-8s /%d\n", "prefix", __builtin_popcount(ntohl(info->mask)));
-	if (info->router)
-		print_ip("router", info->router);
-	if (info->dns)
-		print_ip("dns", info->dns);
-	if (info->lease)
-		printf("  %-8s %u s\n", "lease", ntohl(info->lease));
-}
-
-static int dora(const struct rawsock *rs, const char *ifname) {
-	uint32_t xid;
-	if (getrandom(&xid, sizeof(xid), 0) != sizeof(xid)) {
-		perror("getrandom error");
-		return 1;
-	}
-
-	uint8_t msg[DHCP_MSG_LEN];
-	size_t len = dhcp_build_discover(msg, xid, rs->mac);
-	if (rawsock_send(rs, msg, len) < 0)
-		return 1;
-	printf("DHCPDISCOVER sent on %s (xid 0x%08x)\n", ifname, ntohl(xid));
-
-	struct dhcp_info offer;
-	int r = wait_reply(rs, xid, 1u << DHCPOFFER, 0, &offer);
-	if (r < 0)
-		return 1;
-	if (r == 0) {
-		fprintf(stderr, "no DHCPOFFER within %d ms\n", REPLY_TIMEOUT_MS);
-		return 1;
-	}
-	print_info("DHCPOFFER", &offer);
-	if (!offer.server_id) {
-		fprintf(stderr, "DHCPOFFER without server identifier\n");
-		return 1;
-	}
-
-	len = dhcp_build_request(msg, xid, rs->mac, offer.yiaddr, offer.server_id);
-	if (rawsock_send(rs, msg, len) < 0)
-		return 1;
-	printf("DHCPREQUEST sent\n");
-
-	struct dhcp_info ack;
-	r = wait_reply(rs, xid, 1u << DHCPACK | 1u << DHCPNAK, offer.server_id,
-	               &ack);
-	if (r < 0)
-		return 1;
-	if (r == 0) {
-		fprintf(stderr, "no DHCPACK within %d ms\n", REPLY_TIMEOUT_MS);
-		return 1;
-	}
-	if (ack.type == DHCPNAK) {
-		fprintf(stderr, "DHCPNAK from server\n");
-		return 1;
-	}
-	print_info("DHCPACK", &ack);
+	*out = (unsigned int)v;
 	return 0;
 }
 
-int main(int argc, char *argv[]) {
-	if (argc != 2) {
-		fprintf(stderr, "usage: tundra-dhcpc <interface>\n");
-		return 2;
+static int valid_key(const char *s) {
+	size_t len = strlen(s);
+	if (len == 0 || len > 64 || s[0] == '.')
+		return 0;
+	for (size_t i = 0; i < len; i++) {
+		char ch = s[i];
+		if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		      (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-'))
+			return 0;
 	}
-	if (strcmp(argv[1], "--version") == 0) {
+	return 1;
+}
+
+static void usage(void) {
+	fprintf(stderr, "usage: tundra-dhcpc <interface> [metric <n>] "
+	                "[carrier-grace <ms>] [lease-key <name>] [probe on|off]\n");
+}
+
+int main(int argc, char *argv[]) {
+	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
 		printf("tundra-dhcpc %s\n", TUNDRA_DHCPC_VERSION);
 		return 0;
 	}
+	if (argc < 2 || argc % 2 != 0) {
+		usage();
+		return 2;
+	}
 
-	struct rawsock rs;
-	if (rawsock_open(&rs, argv[1]) < 0)
-		return 1;
+	int has_metric = 0;
+	unsigned int metric = 0;
+	unsigned int grace_ms = 0;
+	const char *lease_key = NULL;
+	int probe = 1;
+	for (int i = 2; i < argc; i += 2) {
+		if (strcmp(argv[i], "metric") == 0 && !has_metric) {
+			if (parse_uint(argv[i + 1], &metric) < 0) {
+				fprintf(stderr, "invalid metric: %s\n", argv[i + 1]);
+				return 2;
+			}
+			has_metric = 1;
+		} else if (strcmp(argv[i], "carrier-grace") == 0) {
+			if (parse_uint(argv[i + 1], &grace_ms) < 0) {
+				fprintf(stderr, "invalid carrier-grace: %s\n", argv[i + 1]);
+				return 2;
+			}
+		} else if (strcmp(argv[i], "lease-key") == 0) {
+			if (!valid_key(argv[i + 1])) {
+				fprintf(stderr, "invalid lease-key: %s\n", argv[i + 1]);
+				return 2;
+			}
+			lease_key = argv[i + 1];
+		} else if (strcmp(argv[i], "probe") == 0) {
+			if (strcmp(argv[i + 1], "on") == 0) {
+				probe = 1;
+			} else if (strcmp(argv[i + 1], "off") == 0) {
+				probe = 0;
+			} else {
+				fprintf(stderr, "invalid probe: %s\n", argv[i + 1]);
+				return 2;
+			}
+		} else {
+			usage();
+			return 2;
+		}
+	}
 
-	int ret = dora(&rs, argv[1]);
-	rawsock_close(&rs);
-	return ret;
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	return client_run(argv[1], has_metric, metric, grace_ms, lease_key, probe);
 }
