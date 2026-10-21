@@ -38,9 +38,8 @@ struct udp_hdr {
 _Static_assert(sizeof(struct ipv4_hdr) == 20, "ipv4_hdr must be 20 bytes");
 _Static_assert(sizeof(struct udp_hdr) == 8, "udp_hdr must be 8 bytes");
 
-static uint16_t inet_csum(const void *data, size_t len) {
+static uint32_t csum_add(uint32_t sum, const void *data, size_t len) {
 	const uint8_t *p = data;
-	uint32_t sum = 0;
 
 	while (len > 1) {
 		sum += (uint32_t)p[0] << 8 | p[1];
@@ -49,13 +48,37 @@ static uint16_t inet_csum(const void *data, size_t len) {
 	}
 	if (len)
 		sum += (uint32_t)p[0] << 8;
+	return sum;
+}
+
+static uint16_t csum_fold(uint32_t sum) {
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
 	return htons((uint16_t)~sum);
 }
 
-static int parse_datagram(const uint8_t *buf, size_t n, const uint8_t **payload,
-                          size_t *len) {
+static uint16_t inet_csum(const void *data, size_t len) {
+	return csum_fold(csum_add(0, data, len));
+}
+
+static int udp_csum_ok(const struct ipv4_hdr *ip, const struct udp_hdr *udp,
+                       const uint8_t *seg, size_t len) {
+	struct {
+		uint32_t saddr;
+		uint32_t daddr;
+		uint8_t zero;
+		uint8_t proto;
+		uint16_t len;
+	} __attribute__((packed)) ph = {ip->saddr, ip->daddr, 0, IPPROTO_UDP,
+	                                udp->len};
+
+	uint32_t sum = csum_add(0, &ph, sizeof(ph));
+	sum = csum_add(sum, seg, len);
+	return csum_fold(sum) == 0;
+}
+
+static int parse_datagram(const uint8_t *buf, size_t n, int csum_trusted,
+                          const uint8_t **payload, size_t *len) {
 	struct ipv4_hdr ip;
 	if (n < sizeof(ip))
 		return -1;
@@ -84,6 +107,9 @@ static int parse_datagram(const uint8_t *buf, size_t n, const uint8_t **payload,
 		return -1;
 	size_t ulen = ntohs(udp.len);
 	if (ulen < sizeof(udp) || ihl + ulen > tot)
+		return -1;
+	if (udp.csum != 0 && !csum_trusted &&
+	    !udp_csum_ok(&ip, &udp, buf + ihl, ulen))
 		return -1;
 
 	*payload = buf + ihl + sizeof(udp);
@@ -114,6 +140,13 @@ int rawsock_open(struct rawsock *rs, const char *ifname) {
 	sll.sll_ifindex = rs->ifindex;
 	if (bind(rs->fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
 		perror("bind error");
+		rawsock_close(rs);
+		return -1;
+	}
+
+	int on = 1;
+	if (setsockopt(rs->fd, SOL_PACKET, PACKET_AUXDATA, &on, sizeof(on)) < 0) {
+		perror("PACKET_AUXDATA error");
 		rawsock_close(rs);
 		return -1;
 	}
@@ -195,15 +228,38 @@ int rawsock_recv(const struct rawsock *rs, uint8_t *buf, size_t cap,
 	if (r == 0)
 		return 0;
 
-	ssize_t n = recv(rs->fd, buf, cap, 0);
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
+	} ctl;
+	struct iovec iov = {.iov_base = buf, .iov_len = cap};
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = ctl.buf;
+	mh.msg_controllen = sizeof(ctl.buf);
+
+	ssize_t n = recvmsg(rs->fd, &mh, 0);
 	if (n < 0) {
 		if (errno == EINTR)
 			return 0;
-		perror("recv error");
+		perror("recvmsg error");
 		return -1;
 	}
 
-	if (parse_datagram(buf, (size_t)n, payload, len) < 0)
+	int csum_trusted = 0;
+	for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm;
+	     cm = CMSG_NXTHDR(&mh, cm)) {
+		if (cm->cmsg_level != SOL_PACKET || cm->cmsg_type != PACKET_AUXDATA)
+			continue;
+		struct tpacket_auxdata aux;
+		memcpy(&aux, CMSG_DATA(cm), sizeof(aux));
+		if (aux.tp_status & (TP_STATUS_CSUMNOTREADY | TP_STATUS_CSUM_VALID))
+			csum_trusted = 1;
+	}
+
+	if (parse_datagram(buf, (size_t)n, csum_trusted, payload, len) < 0)
 		return 0;
 	return 1;
 }

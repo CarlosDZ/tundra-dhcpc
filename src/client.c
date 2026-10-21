@@ -36,6 +36,7 @@
 #define DECLINE_WAIT_MS 10000
 #define MAX_CONFLICTS 3
 #define EXIT_ALERT 111
+#define LIFETIME_MARGIN_S 10
 
 enum state {
 	WAITING,
@@ -53,10 +54,10 @@ enum state {
 struct client {
 	const char *ifname;
 	char lease_path[256];
-	int has_metric;
-	unsigned int metric;
+	struct apply_opts ap;
 	unsigned int grace_ms;
 	int probe;
+	int secs_override;
 	int exit_code;
 	struct rawsock rs;
 	struct udpsock us;
@@ -74,6 +75,8 @@ struct client {
 	int tries;
 	uint64_t backoff;
 	uint64_t retry_ms;
+	uint64_t xact_at;
+	uint16_t discover_secs;
 	struct dhcp_info offer;
 	struct dhcp_info lease;
 	struct dhcp_info pending;
@@ -130,18 +133,45 @@ static uint64_t next_retry(uint64_t now, uint64_t limit) {
 	return now + wait < limit ? now + wait : limit;
 }
 
+static uint16_t elapsed_secs(const struct client *c) {
+	if (c->secs_override >= 0)
+		return (uint16_t)c->secs_override;
+	uint64_t now = now_ms();
+	if (now < c->xact_at)
+		return 0;
+	uint64_t secs = (now - c->xact_at) / 1000;
+	return secs > 0xffff ? 0xffff : (uint16_t)secs;
+}
+
+static uint32_t lifetime_until(uint64_t expiry_at, uint64_t now) {
+	if (expiry_at == UINT64_MAX)
+		return LIFETIME_FOREVER;
+	uint64_t secs = (expiry_at > now ? expiry_at - now : 0) / 1000;
+	secs += LIFETIME_MARGIN_S;
+	return secs >= LIFETIME_FOREVER ? LIFETIME_FOREVER - 1 : (uint32_t)secs;
+}
+
+static uint32_t lease_lifetime(const struct dhcp_info *ack, uint64_t ack_at) {
+	uint32_t lease = ntohl(ack->lease);
+	if (lease == LEASE_INFINITE)
+		return LIFETIME_FOREVER;
+	return lifetime_until(ack_at + scaled_ms(lease), now_ms());
+}
+
 static int send_discover(struct client *c) {
 	uint8_t msg[DHCP_MSG_LEN];
-	size_t len = dhcp_build_discover(msg, c->xid, c->rs.mac);
+	c->discover_secs = elapsed_secs(c);
+	size_t len = dhcp_build_discover(msg, c->xid, c->discover_secs, c->rs.mac);
 	if (rawsock_send(&c->rs, msg, len) < 0)
 		return 0;
 	printf("DHCPDISCOVER sent on %s (xid 0x%08x)\n", c->ifname, ntohl(c->xid));
 	return 0;
 }
 
-static int send_request(struct client *c, uint32_t addr, uint32_t server) {
+static int send_request(struct client *c, uint16_t secs, uint32_t addr,
+                        uint32_t server) {
 	uint8_t msg[DHCP_MSG_LEN];
-	size_t len = dhcp_build_request(msg, c->xid, c->rs.mac, addr, server);
+	size_t len = dhcp_build_request(msg, c->xid, secs, c->rs.mac, addr, server);
 	if (rawsock_send(&c->rs, msg, len) < 0)
 		return 0;
 	printf("DHCPREQUEST sent\n");
@@ -150,7 +180,8 @@ static int send_request(struct client *c, uint32_t addr, uint32_t server) {
 
 static int send_renew(struct client *c, uint32_t dst) {
 	uint8_t msg[DHCP_MSG_LEN];
-	size_t len = dhcp_build_renew(msg, c->xid, c->rs.mac, c->lease.yiaddr);
+	size_t len = dhcp_build_renew(msg, c->xid, elapsed_secs(c), c->rs.mac,
+	                              c->lease.yiaddr);
 	udpsock_send(&c->us, dst, msg, len);
 	return 0;
 }
@@ -174,7 +205,7 @@ static void arp_close(struct client *c) {
 
 static void drop_address(struct client *c) {
 	if (c->applied)
-		apply_remove(c->ifname, &c->lease);
+		apply_remove(c->ifname, &c->lease, &c->ap);
 	c->applied = 0;
 	udpsock_close(&c->us);
 }
@@ -204,7 +235,8 @@ static int start_discovery(struct client *c) {
 		return -1;
 	c->state = SELECTING;
 	c->backoff = BACKOFF_START_MS;
-	arm_retry(c, now_ms());
+	c->xact_at = now_ms();
+	arm_retry(c, c->xact_at);
 	return send_discover(c);
 }
 
@@ -218,9 +250,10 @@ static int start_reboot(struct client *c) {
 	c->state = REBOOTING;
 	c->tries = 0;
 	c->backoff = BACKOFF_START_MS;
-	arm_retry(c, now_ms());
+	c->xact_at = now_ms();
+	arm_retry(c, c->xact_at);
 	printf("requesting previous address %s\n", ip_str(c->lease.yiaddr, a));
-	return send_request(c, c->lease.yiaddr, 0);
+	return send_request(c, elapsed_secs(c), c->lease.yiaddr, 0);
 }
 
 static int defer_discovery(struct client *c) {
@@ -232,6 +265,7 @@ static int defer_discovery(struct client *c) {
 	c->state = SELECTING;
 	c->backoff = BACKOFF_START_MS;
 	c->deadline = now_ms() + c->retry_ms;
+	c->xact_at = c->deadline;
 	printf("retrying in %llu ms\n", (unsigned long long)c->retry_ms);
 	if (c->retry_ms < BACKOFF_MAX_MS)
 		c->retry_ms *= 2;
@@ -271,7 +305,7 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
                          uint64_t ack_at) {
 	char a[INET_ADDRSTRLEN], s[INET_ADDRSTRLEN];
 
-	if (apply_lease(c->ifname, ack, c->has_metric, c->metric) < 0) {
+	if (apply_lease(c->ifname, ack, &c->ap, lease_lifetime(ack, ack_at)) < 0) {
 		fprintf(stderr, "could not apply lease on %s\n", c->ifname);
 		drop_address(c);
 		arp_close(c);
@@ -343,6 +377,9 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 			return defer_discovery(c);
 		}
 		rawsock_close(&c->rs);
+		if (apply_refresh(c->ifname, ack, &c->ap, lease_lifetime(ack, now)) < 0)
+			fprintf(stderr, "could not refresh address lifetime on %s\n",
+			        c->ifname);
 		c->lease = *ack;
 		c->state = BOUND;
 		set_timers(c, now);
@@ -370,6 +407,7 @@ static int restart_after(struct client *c, uint64_t ms) {
 	c->state = SELECTING;
 	c->backoff = BACKOFF_START_MS;
 	c->deadline = now_ms() + ms;
+	c->xact_at = c->deadline;
 	printf("restarting discovery in %llu ms\n", (unsigned long long)ms);
 	return 0;
 }
@@ -472,14 +510,15 @@ static int on_timeout(struct client *c) {
 			return start_discovery(c);
 		}
 		arm_retry(c, now);
-		return send_request(c, c->offer.yiaddr, c->offer.server_id);
+		return send_request(c, c->discover_secs, c->offer.yiaddr,
+		                    c->offer.server_id);
 	case REBOOTING:
 		if (++c->tries >= REQUEST_TRIES) {
 			if (c->applied) {
 				printf("no answer, keeping previous lease\n");
 				if (c->applied < 0 &&
-				    apply_lease(c->ifname, &c->lease, c->has_metric,
-				                c->metric) < 0) {
+				    apply_lease(c->ifname, &c->lease, &c->ap,
+				                lifetime_until(c->expiry_at, now)) < 0) {
 					drop_address(c);
 					return defer_discovery(c);
 				}
@@ -497,7 +536,7 @@ static int on_timeout(struct client *c) {
 			return start_discovery(c);
 		}
 		arm_retry(c, now);
-		return send_request(c, c->lease.yiaddr, 0);
+		return send_request(c, elapsed_secs(c), c->lease.yiaddr, 0);
 	case PROBING:
 		if (c->probes < PROBE_NUM) {
 			arp_probe(c->arpfd, c->rs.ifindex, c->rs.mac, c->pending.yiaddr);
@@ -523,6 +562,7 @@ static int on_timeout(struct client *c) {
 		if (new_xid(c) < 0)
 			return -1;
 		c->state = RENEWING;
+		c->xact_at = now;
 		printf("renewing lease with %s\n", ip_str(c->lease.server_id, s));
 		/* fall through */
 	case RENEWING:
@@ -567,7 +607,8 @@ static int on_reply(struct client *c, const struct dhcp_info *r) {
 		c->tries = 0;
 		c->backoff = BACKOFF_START_MS;
 		arm_retry(c, now_ms());
-		return send_request(c, c->offer.yiaddr, c->offer.server_id);
+		return send_request(c, c->discover_secs, c->offer.yiaddr,
+		                    c->offer.server_id);
 	case REQUESTING:
 		if (r->server_id != c->offer.server_id)
 			return 0;
@@ -747,15 +788,16 @@ static void load_lease(struct client *c) {
 	printf("previous lease %s found\n", ip_str(c->lease.yiaddr, a));
 }
 
-int client_run(const char *ifname, int has_metric, unsigned int metric,
-               unsigned int grace_ms, const char *lease_key, int probe) {
+int client_run(const char *ifname, const struct apply_opts *ap,
+               unsigned int grace_ms, const char *lease_key, int probe,
+               int secs_override) {
 	struct client c;
 	memset(&c, 0, sizeof(c));
 	c.ifname = ifname;
-	c.has_metric = has_metric;
-	c.metric = metric;
+	c.ap = *ap;
 	c.grace_ms = grace_ms;
 	c.probe = probe;
+	c.secs_override = secs_override;
 	c.exit_code = 1;
 	c.us.fd = -1;
 	c.arpfd = -1;

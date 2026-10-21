@@ -29,17 +29,16 @@ struct dhcp_info {
 };
 
 size_t dhcp_build_discover(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                           const unsigned char mac[ETH_ALEN]);
-
+                           uint16_t secs, const unsigned char mac[ETH_ALEN]);
 size_t dhcp_build_request(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
-                          const unsigned char mac[ETH_ALEN], uint32_t addr,
-                          uint32_t server);
+                          uint16_t secs, const unsigned char mac[ETH_ALEN],
+                          uint32_t addr, uint32_t server);
 
 size_t dhcp_build_decline(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
                           const unsigned char mac[ETH_ALEN], uint32_t addr,
                           uint32_t server);
 
-size_t dhcp_build_renew(uint8_t buf[DHCP_MSG_LEN], uint32_t xid,
+size_t dhcp_build_renew(uint8_t buf[DHCP_MSG_LEN], uint32_t xid, uint16_t secs,
                         const unsigned char mac[ETH_ALEN], uint32_t ciaddr);
 
 int dhcp_parse_reply(const uint8_t *msg, size_t len, uint32_t xid,
