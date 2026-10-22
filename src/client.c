@@ -33,10 +33,24 @@
 #define ANNOUNCE_WAIT_MS 2000
 #define ANNOUNCE_NUM 2
 #define ANNOUNCE_INTERVAL_MS 2000
-#define DECLINE_WAIT_MS 10000
-#define MAX_CONFLICTS 3
+#define DECLINE_WAIT_S 10
 #define EXIT_ALERT 111
+#define DEFEND_INTERVAL_S 10
+#define CONFLICT_WINDOW_MS 300000
+#define MAX_RECORDS 16
+#define LIMIT_SAME_MAC 3
+#define LIMIT_PAIRS 10
+#define LIMIT_CLAIMS 3
+#define GW_WAIT_MS 1000
+#define MAX_GW_MACS 4
 #define LIFETIME_MARGIN_S 10
+
+struct conflict {
+	uint64_t at;
+	uint32_t addr;
+	unsigned char mac[ETH_ALEN];
+	int bound;
+};
 
 enum state {
 	WAITING,
@@ -65,9 +79,14 @@ struct client {
 	int arpfd;
 	int probes;
 	int announces;
-	int conflicts;
-	uint32_t conflict_addr[MAX_CONFLICTS];
-	unsigned char conflict_mac[MAX_CONFLICTS][ETH_ALEN];
+	struct conflict recs[MAX_RECORDS];
+	int nrecs;
+	uint64_t last_defense;
+	unsigned char gw_mac[ETH_ALEN];
+	int gw_known;
+	unsigned char gw_seen[MAX_GW_MACS][ETH_ALEN];
+	int ngw_seen;
+	uint64_t gw_until;
 	int carrier;
 	int applied;
 	enum state state;
@@ -186,10 +205,9 @@ static int send_renew(struct client *c, uint32_t dst) {
 	return 0;
 }
 
-static int send_decline(struct client *c) {
+static int send_decline(struct client *c, uint32_t addr, uint32_t server) {
 	uint8_t msg[DHCP_MSG_LEN];
-	size_t len = dhcp_build_decline(msg, c->xid, c->rs.mac, c->pending.yiaddr,
-	                                c->pending.server_id);
+	size_t len = dhcp_build_decline(msg, c->xid, c->rs.mac, addr, server);
 	if (rawsock_send(&c->rs, msg, len) < 0)
 		return 0;
 	printf("DHCPDECLINE sent\n");
@@ -207,7 +225,24 @@ static void drop_address(struct client *c) {
 	if (c->applied)
 		apply_remove(c->ifname, &c->lease, &c->ap);
 	c->applied = 0;
+	c->gw_until = 0;
 	udpsock_close(&c->us);
+	arp_close(c);
+}
+
+static int ensure_arp(struct client *c) {
+	if (c->arpfd < 0)
+		c->arpfd = arp_open(c->rs.ifindex);
+	return c->arpfd < 0 ? -1 : 0;
+}
+
+static void start_gw_check(struct client *c) {
+	if (!c->lease.router || ensure_arp(c) < 0)
+		return;
+	c->ngw_seen = 0;
+	arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
+	            c->lease.router);
+	c->gw_until = now_ms() + GW_WAIT_MS;
 }
 
 static void forget_lease(struct client *c) {
@@ -319,7 +354,7 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
 	}
 	rawsock_close(&c->rs);
 	c->retry_ms = BACKOFF_START_MS;
-	c->conflicts = 0;
+	c->last_defense = 0;
 
 	c->lease = *ack;
 	set_timers(c, ack_at);
@@ -327,13 +362,13 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
 	printf("bound to %s from %s, lease %u s\n", ip_str(ack->yiaddr, a),
 	       ip_str(ack->server_id, s), ntohl(ack->lease));
 
-	if (c->arpfd < 0)
-		c->arpfd = arp_open(c->rs.ifindex);
-	if (c->arpfd >= 0) {
-		arp_announce(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr);
+	if (ensure_arp(c) == 0) {
+		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
+		            c->lease.yiaddr);
 		c->announces = 1;
 		c->state = ANNOUNCING;
 		c->deadline = now_ms() + ANNOUNCE_INTERVAL_MS;
+		start_gw_check(c);
 		return 0;
 	}
 	c->state = BOUND;
@@ -387,6 +422,7 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 		save_lease(c);
 		printf("renewed %s from %s, lease %u s\n", ip_str(ack->yiaddr, a),
 		       ip_str(ack->server_id, s), ntohl(ack->lease));
+		start_gw_check(c);
 		return 0;
 	}
 
@@ -412,42 +448,211 @@ static int restart_after(struct client *c, uint64_t ms) {
 	return 0;
 }
 
-static void alert(struct client *c) {
-	char a[INET_ADDRSTRLEN];
-
-	fprintf(stderr,
-	        "alert: %d consecutive address conflicts on %s:", c->conflicts,
-	        c->ifname);
-	for (int i = 0; i < c->conflicts; i++) {
-		const unsigned char *m = c->conflict_mac[i];
-		fprintf(stderr, " %s (%02x:%02x:%02x:%02x:%02x:%02x)",
-		        ip_str(c->conflict_addr[i], a), m[0], m[1], m[2], m[3], m[4],
-		        m[5]);
-	}
-	fprintf(stderr, "\n");
+static const char *mac_str(const unsigned char m[ETH_ALEN], char buf[18]) {
+	snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3],
+	         m[4], m[5]);
+	return buf;
 }
 
-static int on_conflict(struct client *c, const unsigned char mac[ETH_ALEN]) {
-	char a[INET_ADDRSTRLEN];
+static int mac_invalid(const unsigned char m[ETH_ALEN]) {
+	static const unsigned char zero[ETH_ALEN];
+	return (m[0] & 1) || memcmp(m, zero, ETH_ALEN) == 0;
+}
 
-	printf("address %s in use by %02x:%02x:%02x:%02x:%02x:%02x\n",
-	       ip_str(c->pending.yiaddr, a), mac[0], mac[1], mac[2], mac[3], mac[4],
-	       mac[5]);
-	c->conflict_addr[c->conflicts] = c->pending.yiaddr;
-	memcpy(c->conflict_mac[c->conflicts], mac, ETH_ALEN);
-	c->conflicts++;
+static void record(struct client *c, uint32_t addr,
+                   const unsigned char mac[ETH_ALEN], int bound) {
+	uint64_t now = now_ms();
+	int n = 0;
+	for (int i = 0; i < c->nrecs; i++)
+		if (now - c->recs[i].at < CONFLICT_WINDOW_MS)
+			c->recs[n++] = c->recs[i];
+	if (n == MAX_RECORDS) {
+		memmove(&c->recs[0], &c->recs[1],
+		        (MAX_RECORDS - 1) * sizeof(c->recs[0]));
+		n--;
+	}
+	c->recs[n].at = now;
+	c->recs[n].addr = addr;
+	memcpy(c->recs[n].mac, mac, ETH_ALEN);
+	c->recs[n].bound = bound;
+	c->nrecs = n + 1;
+}
 
-	send_decline(c);
-	arp_close(c);
+static int pair_seen(const struct client *c, int i) {
+	for (int j = 0; j < i; j++)
+		if (c->recs[j].addr == c->recs[i].addr &&
+		    memcmp(c->recs[j].mac, c->recs[i].mac, ETH_ALEN) == 0)
+			return 1;
+	return 0;
+}
+
+static const char *evaluate(const struct client *c,
+                            const unsigned char mac[ETH_ALEN]) {
+	if (mac_invalid(mac))
+		return "invalid responder MAC";
+
+	int addrs = 0, pairs = 0, claims = 0;
+	for (int i = 0; i < c->nrecs; i++) {
+		if (c->recs[i].bound)
+			claims++;
+		if (pair_seen(c, i))
+			continue;
+		pairs++;
+		if (memcmp(c->recs[i].mac, mac, ETH_ALEN) == 0)
+			addrs++;
+	}
+	if (addrs >= LIMIT_SAME_MAC)
+		return "single host claiming addresses (A)";
+	if (claims >= LIMIT_CLAIMS)
+		return "address in use repeatedly claimed (C)";
+	if (pairs >= LIMIT_PAIRS)
+		return "many hosts claiming addresses (B)";
+	return NULL;
+}
+
+static int raise_alert(struct client *c, const char *kind) {
+	char a[INET_ADDRSTRLEN], m[18];
+	int gw_hint = 0;
+
+	fprintf(stderr, "alert: %s on %s:", kind, c->ifname);
+	for (int i = 0; i < c->nrecs; i++) {
+		fprintf(stderr, " %s (%s)", ip_str(c->recs[i].addr, a),
+		        mac_str(c->recs[i].mac, m));
+		if (c->gw_known && memcmp(c->recs[i].mac, c->gw_mac, ETH_ALEN) == 0)
+			gw_hint = 1;
+	}
+	if (gw_hint)
+		fprintf(stderr, "; responder uses the gateway MAC (proxy ARP or "
+		                "gateway impersonation)");
+	fprintf(stderr, "\n");
+
+	drop_address(c);
+	forget_lease(c);
+	c->exit_code = EXIT_ALERT;
+	return -1;
+}
+
+static int raise_gw_alert(struct client *c) {
+	char a[INET_ADDRSTRLEN], m[18];
+
+	fprintf(stderr, "alert: gateway impersonation (D) on %s: %s claimed by",
+	        c->ifname, ip_str(c->lease.router, a));
+	for (int i = 0; i < c->ngw_seen; i++)
+		fprintf(stderr, " %s", mac_str(c->gw_seen[i], m));
+	fprintf(stderr, "\n");
+
+	drop_address(c);
+	forget_lease(c);
+	c->exit_code = EXIT_ALERT;
+	return -1;
+}
+
+static int give_up(struct client *c, uint32_t addr, uint32_t server,
+                   const unsigned char mac[ETH_ALEN], int after_bind) {
+	char a[INET_ADDRSTRLEN], m[18];
+
+	printf("address %s in use by %s\n", ip_str(addr, a), mac_str(mac, m));
+	record(c, addr, mac, after_bind);
+
+	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
+		return -1;
+	send_decline(c, addr, server);
 	drop_address(c);
 	forget_lease(c);
 
-	if (c->conflicts >= MAX_CONFLICTS) {
-		alert(c);
-		c->exit_code = EXIT_ALERT;
-		return -1;
+	const char *kind = evaluate(c, mac);
+	if (kind)
+		return raise_alert(c, kind);
+	return restart_after(c, scaled_ms(DECLINE_WAIT_S));
+}
+
+static int on_claim(struct client *c, const unsigned char mac[ETH_ALEN]) {
+	char a[INET_ADDRSTRLEN], m[18];
+	uint64_t now = now_ms();
+
+	if (mac_invalid(mac) ||
+	    (c->last_defense &&
+	     now - c->last_defense < scaled_ms(DEFEND_INTERVAL_S)))
+		return give_up(c, c->lease.yiaddr, c->lease.server_id, mac, 1);
+
+	record(c, c->lease.yiaddr, mac, 1);
+	const char *kind = evaluate(c, mac);
+	if (kind)
+		return raise_alert(c, kind);
+
+	arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
+	            c->lease.yiaddr);
+	c->last_defense = now;
+	printf("defending address %s against %s\n", ip_str(c->lease.yiaddr, a),
+	       mac_str(mac, m));
+	return 0;
+}
+
+static void gw_seen_add(struct client *c, const unsigned char mac[ETH_ALEN]) {
+	for (int i = 0; i < c->ngw_seen; i++)
+		if (memcmp(c->gw_seen[i], mac, ETH_ALEN) == 0)
+			return;
+	if (c->ngw_seen < MAX_GW_MACS)
+		memcpy(c->gw_seen[c->ngw_seen++], mac, ETH_ALEN);
+}
+
+static int gw_evaluate(struct client *c) {
+	char m[18];
+
+	c->gw_until = 0;
+	if (c->ngw_seen >= 2)
+		return raise_gw_alert(c);
+	if (c->ngw_seen == 1) {
+		if (!c->gw_known || memcmp(c->gw_mac, c->gw_seen[0], ETH_ALEN) != 0)
+			printf("gateway is at %s\n", mac_str(c->gw_seen[0], m));
+		memcpy(c->gw_mac, c->gw_seen[0], ETH_ALEN);
+		c->gw_known = 1;
 	}
-	return restart_after(c, DECLINE_WAIT_MS);
+	return 0;
+}
+
+static int on_arp(struct client *c) {
+	struct arp_msg msg;
+	int r = arp_read(c->arpfd, &msg);
+	if (r <= 0)
+		return r;
+	if (memcmp(msg.sha, c->rs.mac, ETH_ALEN) == 0)
+		return 0;
+
+	switch (c->state) {
+	case PROBING:
+		if (msg.spa == c->pending.yiaddr ||
+		    (msg.spa == 0 && msg.tpa == c->pending.yiaddr))
+			return give_up(c, c->pending.yiaddr, c->pending.server_id, msg.sha,
+			               0);
+		return 0;
+	case ANNOUNCING:
+	case BOUND:
+	case RENEWING:
+	case REBINDING:
+		if (msg.spa == c->lease.yiaddr)
+			return on_claim(c, msg.sha);
+		if (c->lease.router && msg.spa == c->lease.router) {
+			if (c->gw_until) {
+				gw_seen_add(c, msg.sha);
+				return 0;
+			}
+			if (c->gw_known && memcmp(msg.sha, c->gw_mac, ETH_ALEN) != 0) {
+				c->ngw_seen = 0;
+				gw_seen_add(c, c->gw_mac);
+				gw_seen_add(c, msg.sha);
+				return raise_gw_alert(c);
+			}
+		}
+		return 0;
+	case WAITING:
+	case GRACE:
+	case SELECTING:
+	case REQUESTING:
+	case REBOOTING:
+		break;
+	}
+	return 0;
 }
 
 static int on_carrier_up(struct client *c) {
@@ -528,6 +733,7 @@ static int on_timeout(struct client *c) {
 					return defer_discovery(c);
 				}
 				rawsock_close(&c->rs);
+				ensure_arp(c);
 				c->state = BOUND;
 				c->deadline = c->t1_at;
 				return 0;
@@ -539,7 +745,8 @@ static int on_timeout(struct client *c) {
 		return send_request(c, elapsed_secs(c), c->lease.yiaddr, 0);
 	case PROBING:
 		if (c->probes < PROBE_NUM) {
-			arp_probe(c->arpfd, c->rs.ifindex, c->rs.mac, c->pending.yiaddr);
+			arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, 0,
+			            c->pending.yiaddr);
 			c->probes++;
 			if (c->probes < PROBE_NUM)
 				c->deadline = now + random_ms(PROBE_MIN_MS, PROBE_MAX_MS);
@@ -549,12 +756,12 @@ static int on_timeout(struct client *c) {
 		}
 		return complete_bind(c, &c->pending, c->ack_at);
 	case ANNOUNCING:
-		arp_announce(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr);
+		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
+		            c->lease.yiaddr);
 		if (++c->announces < ANNOUNCE_NUM) {
 			c->deadline = now + ANNOUNCE_INTERVAL_MS;
 			return 0;
 		}
-		arp_close(c);
 		c->state = BOUND;
 		c->deadline = c->t1_at;
 		return 0;
@@ -644,13 +851,6 @@ static int on_packet(struct client *c) {
 	size_t len;
 	int r;
 
-	if (c->state == PROBING) {
-		unsigned char sender[ETH_ALEN];
-		r = arp_conflict(c->arpfd, c->rs.mac, c->pending.yiaddr, sender);
-		if (r <= 0)
-			return r;
-		return on_conflict(c, sender);
-	}
 	if (c->state == SELECTING || c->state == REQUESTING ||
 	    c->state == REBOOTING)
 		r = rawsock_recv(&c->rs, buf, sizeof(buf), 0, &msg, &len);
@@ -695,7 +895,7 @@ static int on_link(struct client *c) {
 	return -1;
 }
 
-static int active_fd(const struct client *c) {
+static int dhcp_fd(const struct client *c) {
 	switch (c->state) {
 	case SELECTING:
 	case REQUESTING:
@@ -704,10 +904,9 @@ static int active_fd(const struct client *c) {
 	case RENEWING:
 	case REBINDING:
 		return c->us.fd;
-	case PROBING:
-		return c->arpfd;
 	case WAITING:
 	case GRACE:
+	case PROBING:
 	case ANNOUNCING:
 	case BOUND:
 		break;
@@ -734,20 +933,29 @@ static int open_signals(void) {
 static int loop(struct client *c, int sfd) {
 	for (;;) {
 		uint64_t now = now_ms();
+		if (c->gw_until && now >= c->gw_until) {
+			if (gw_evaluate(c) < 0)
+				return c->exit_code;
+			continue;
+		}
 		if (now >= c->deadline) {
 			if (on_timeout(c) < 0)
 				return c->exit_code;
 			continue;
 		}
 
-		uint64_t wait = c->deadline - now;
+		uint64_t next = c->deadline;
+		if (c->gw_until && c->gw_until < next)
+			next = c->gw_until;
+		uint64_t wait = next - now;
 		if (wait > MAX_WAIT_MS)
 			wait = MAX_WAIT_MS;
 
-		struct pollfd pfd[3] = {{.fd = active_fd(c), .events = POLLIN},
+		struct pollfd pfd[4] = {{.fd = dhcp_fd(c), .events = POLLIN},
 		                        {.fd = sfd, .events = POLLIN},
-		                        {.fd = c->linkfd, .events = POLLIN}};
-		if (poll(pfd, 3, (int)wait) < 0) {
+		                        {.fd = c->linkfd, .events = POLLIN},
+		                        {.fd = c->arpfd, .events = POLLIN}};
+		if (poll(pfd, 4, (int)wait) < 0) {
 			if (errno == EINTR)
 				continue;
 			perror("poll error");
@@ -763,6 +971,12 @@ static int loop(struct client *c, int sfd) {
 		if (pfd[2].revents & POLLIN) {
 			if (on_link(c) < 0)
 				return c->exit_code;
+			continue;
+		}
+		if (pfd[3].revents & POLLIN) {
+			if (on_arp(c) < 0)
+				return c->exit_code;
+			continue;
 		}
 		if (pfd[0].revents & POLLIN) {
 			if (on_packet(c) < 0)
