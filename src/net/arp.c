@@ -44,8 +44,8 @@ int arp_open(int ifindex) {
 	return fd;
 }
 
-static int arp_send(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
-                    uint32_t spa, uint32_t tpa) {
+int arp_request(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
+                uint32_t spa, uint32_t tpa) {
 	struct arp_pkt p;
 	memset(&p, 0, sizeof(p));
 	p.htype = htons(1);
@@ -73,18 +73,7 @@ static int arp_send(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
 	return 0;
 }
 
-int arp_probe(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
-              uint32_t addr) {
-	return arp_send(fd, ifindex, mac, 0, addr);
-}
-
-int arp_announce(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
-                 uint32_t addr) {
-	return arp_send(fd, ifindex, mac, addr, addr);
-}
-
-int arp_conflict(int fd, const unsigned char mac[ETH_ALEN], uint32_t addr,
-                 unsigned char sender[ETH_ALEN]) {
+int arp_read(int fd, struct arp_msg *m) {
 	struct arp_pkt p;
 	ssize_t n = recv(fd, &p, sizeof(p), MSG_DONTWAIT);
 	if (n < 0) {
@@ -96,12 +85,10 @@ int arp_conflict(int fd, const unsigned char mac[ETH_ALEN], uint32_t addr,
 	if ((size_t)n < sizeof(p) || p.htype != htons(1) ||
 	    p.ptype != htons(ETH_P_IP) || p.hlen != ETH_ALEN || p.plen != 4)
 		return 0;
-	if (memcmp(p.sha, mac, ETH_ALEN) == 0)
-		return 0;
 
-	if (p.spa == addr || (p.spa == 0 && p.tpa == addr)) {
-		memcpy(sender, p.sha, ETH_ALEN);
-		return 1;
-	}
-	return 0;
+	m->oper = ntohs(p.oper);
+	memcpy(m->sha, p.sha, ETH_ALEN);
+	m->spa = p.spa;
+	m->tpa = p.tpa;
+	return 1;
 }
