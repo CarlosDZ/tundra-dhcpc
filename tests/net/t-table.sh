@@ -4,6 +4,9 @@ setup
 start_client table local
 wait_client 3
 expect_exit 2 "reserved table rejected"
+start_client table tdc-no-such-table
+wait_client 3
+expect_exit 2 "unknown table rejected before applying"
 start_client rule-priority 1000
 wait_client 3
 expect_exit 2 "rule-priority without table rejected"

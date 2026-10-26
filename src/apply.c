@@ -41,7 +41,7 @@ static int run(const struct cmd *c, int quiet) {
 	pid_t pid = fork();
 	if (pid < 0) {
 		perror("fork error");
-		return -1;
+		return APPLY_FAIL;
 	}
 	if (pid == 0) {
 		sigset_t none;
@@ -63,7 +63,7 @@ static int run(const struct cmd *c, int quiet) {
 	while (waitpid(pid, &status, 0) < 0) {
 		if (errno != EINTR) {
 			perror("waitpid error");
-			return -1;
+			return APPLY_FAIL;
 		}
 	}
 
@@ -71,13 +71,13 @@ static int run(const struct cmd *c, int quiet) {
 		if (!quiet)
 			fprintf(stderr, "tundra-ip killed by signal %d\n",
 			        WTERMSIG(status));
-		return -1;
+		return APPLY_FAIL;
 	}
 	if (WEXITSTATUS(status) != 0) {
 		if (!quiet)
 			fprintf(stderr, "tundra-ip exited with status %d\n",
 			        WEXITSTATUS(status));
-		return -1;
+		return WEXITSTATUS(status) == 2 ? APPLY_USAGE : APPLY_FAIL;
 	}
 	return 0;
 }
@@ -180,6 +180,7 @@ static void default_del(const char *ifname, const char *table) {
 static int apply_routes(const char *ifname, const struct dhcp_info *info,
                         const struct apply_opts *opts, const struct addrs *a) {
 	struct cmd c;
+	int r;
 	if (opts->table) {
 		cmd_init(&c, "route", "replace");
 		cmd_add(&c, a->net);
@@ -188,15 +189,16 @@ static int apply_routes(const char *ifname, const struct dhcp_info *info,
 		cmd_pair(&c, "src", a->ip);
 		if (opts->has_metric)
 			cmd_pair(&c, "metric", a->metric);
-		if (run(&c, 0) < 0)
-			return -1;
+		if ((r = run(&c, 0)) < 0)
+			return r;
 	}
 
 	if (info->router) {
-		if (default_replace(ifname, opts, a, NULL) < 0)
-			return -1;
-		if (opts->table && default_replace(ifname, opts, a, opts->table) < 0)
-			return -1;
+		if ((r = default_replace(ifname, opts, a, NULL)) < 0)
+			return r;
+		if (opts->table &&
+		    (r = default_replace(ifname, opts, a, opts->table)) < 0)
+			return r;
 	}
 
 	if (opts->table) {
@@ -205,8 +207,8 @@ static int apply_routes(const char *ifname, const struct dhcp_info *info,
 		cmd_pair(&c, "from", a->host);
 		cmd_pair(&c, "table", opts->table);
 		cmd_pair(&c, "priority", a->priority);
-		if (run(&c, 0) < 0)
-			return -1;
+		if ((r = run(&c, 0)) < 0)
+			return r;
 	}
 	return 0;
 }
@@ -215,12 +217,15 @@ int apply_lease(const char *ifname, const struct dhcp_info *info,
                 const struct apply_opts *opts, uint32_t lifetime) {
 	struct addrs a;
 	if (format_addrs(info, opts, &a) < 0)
-		return -1;
-	if (addr_replace(ifname, opts, &a, lifetime) < 0)
-		return -1;
-	if (apply_routes(ifname, info, opts, &a) < 0) {
+		return APPLY_FAIL;
+
+	int r = addr_replace(ifname, opts, &a, lifetime);
+	if (r < 0)
+		return r;
+	r = apply_routes(ifname, info, opts, &a);
+	if (r < 0) {
 		apply_remove(ifname, info, opts);
-		return -1;
+		return r;
 	}
 	return 0;
 }
@@ -229,7 +234,7 @@ int apply_refresh(const char *ifname, const struct dhcp_info *info,
                   const struct apply_opts *opts, uint32_t lifetime) {
 	struct addrs a;
 	if (format_addrs(info, opts, &a) < 0)
-		return -1;
+		return APPLY_FAIL;
 	return addr_replace(ifname, opts, &a, lifetime);
 }
 

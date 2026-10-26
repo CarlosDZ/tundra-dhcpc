@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/filter.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <poll.h>
@@ -117,6 +118,28 @@ static int parse_datagram(const uint8_t *buf, size_t n, int csum_trusted,
 	return 0;
 }
 
+static int attach_filter(int fd) {
+	struct sock_filter code[] = {
+	    BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 9),
+	    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_UDP, 0, 6),
+	    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 6),
+	    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x3fff, 4, 0),
+	    BPF_STMT(BPF_LDX | BPF_B | BPF_MSH, 0),
+	    BPF_STMT(BPF_LD | BPF_H | BPF_IND, 2),
+	    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, DHCP_CLIENT_PORT, 0, 1),
+	    BPF_STMT(BPF_RET | BPF_K, 0xffffffff),
+	    BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog prog = {.len = sizeof(code) / sizeof(code[0]),
+	                          .filter = code};
+
+	if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) < 0) {
+		perror("SO_ATTACH_FILTER error");
+		return -1;
+	}
+	return 0;
+}
+
 int rawsock_open(struct rawsock *rs, const char *ifname) {
 	rs->fd = -1;
 
@@ -130,6 +153,10 @@ int rawsock_open(struct rawsock *rs, const char *ifname) {
 	rs->fd = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_IP));
 	if (rs->fd < 0) {
 		perror("socket(AF_PACKET) error");
+		return -1;
+	}
+	if (attach_filter(rs->fd) < 0) {
+		rawsock_close(rs);
 		return -1;
 	}
 

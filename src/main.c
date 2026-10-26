@@ -124,9 +124,16 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "rule-priority requires table\n");
 		return 2;
 	}
-	if (ap.table && apply_check_table(ap.table) < 0) {
-		fprintf(stderr, "invalid table: %s\n", ap.table);
-		return 2;
+	if (ap.table) {
+		int r = apply_check_table(ap.table);
+		if (r == APPLY_USAGE) {
+			fprintf(stderr, "invalid table: %s\n", ap.table);
+			return 2;
+		}
+		if (r < 0) {
+			fprintf(stderr, "could not check table %s\n", ap.table);
+			return 1;
+		}
 	}
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
