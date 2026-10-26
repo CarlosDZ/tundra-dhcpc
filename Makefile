@@ -54,24 +54,11 @@ $(TEST_BUILD)/tools/%: tests/tools/%.c
 	$(CC) $(TUNDRA_STD) $(CFLAGS) -D_GNU_SOURCE -o $@ $<
 
 UNIT_FLAGS = -g -fsanitize=address,undefined -fno-omit-frame-pointer
-UNIT_DEFS = -D_GNU_SOURCE -Itests/unit
-UNIT_TESTS = $(TEST_BUILD)/unit/dhcp $(TEST_BUILD)/unit/lease \
-             $(TEST_BUILD)/unit/checksum
+UNIT_TESTS = $(patsubst tests/unit/%.c,$(TEST_BUILD)/unit/%,$(wildcard tests/unit/*.c))
 
-$(TEST_BUILD)/unit/dhcp: tests/unit/dhcp.c src/dhcp/dhcp.c $(HDRS)
+$(TEST_BUILD)/unit/%: tests/unit/%.c tests/unit/test.h $(SRCS) $(HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) $(UNIT_DEFS) \
-		-o $@ tests/unit/dhcp.c src/dhcp/dhcp.c
-
-$(TEST_BUILD)/unit/lease: tests/unit/lease.c src/dhcp/lease.c $(HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) $(UNIT_DEFS) \
-		-o $@ tests/unit/lease.c src/dhcp/lease.c
-
-$(TEST_BUILD)/unit/checksum: tests/unit/checksum.c src/net/rawsock.c $(HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) $(UNIT_DEFS) \
-		-o $@ tests/unit/checksum.c
+	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) -Itests/unit -D_GNU_SOURCE -o $@ $<
 
 check-unit: $(UNIT_TESTS)
 	@rc=0; for t in $(UNIT_TESTS); do echo "# $$t"; $$t || rc=1; done; exit $$rc

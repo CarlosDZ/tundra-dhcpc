@@ -24,4 +24,15 @@ while has_addr && [ "$n" -lt 400 ]; do
 	n=$((n + 1))
 done
 check "kernel removes the address after SIGKILL" no_addr
+
+setup
+echo 2 >"$TIP_FAIL"
+start_client metric 200 probe off
+wait_client 15
+expect_exit 2 "a usage error from tundra-ip is fatal"
+expect_log "invalid configuration for tundra-ip" 1 "the configuration error is reported"
+check "no retry after a configuration error" sh -c "! grep -q 'retrying in' '$LOG'"
+check "nothing left applied" no_addr
+check "no lease file left" test ! -e "$LEASES/$IF.lease"
+rm -f "$TIP_FAIL"
 summary

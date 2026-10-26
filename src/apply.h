@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #define LIFETIME_FOREVER 0xffffffffu
+#define APPLY_FAIL -1
+#define APPLY_USAGE -2
 
 struct apply_opts {
 	int has_metric;

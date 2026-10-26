@@ -1,4 +1,4 @@
-#include "lease.h"
+#include "dhcp/lease.c"
 #include "test.h"
 
 #include <arpa/inet.h>

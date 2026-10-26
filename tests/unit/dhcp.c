@@ -1,4 +1,4 @@
-#include "dhcp.h"
+#include "dhcp/dhcp.c"
 #include "test.h"
 
 #include <arpa/inet.h>

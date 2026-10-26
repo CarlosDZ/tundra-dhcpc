@@ -35,6 +35,7 @@
 #define ANNOUNCE_INTERVAL_MS 2000
 #define DECLINE_WAIT_S 10
 #define EXIT_ALERT 111
+#define EXIT_USAGE 2
 #define DEFEND_INTERVAL_S 10
 #define CONFLICT_WINDOW_MS 300000
 #define MAX_RECORDS 16
@@ -336,11 +337,23 @@ static void set_timers(struct client *c, uint64_t now) {
 	c->expiry_at = now + scaled_ms(lease);
 }
 
+static int config_error(struct client *c) {
+	fprintf(stderr, "invalid configuration for tundra-ip on %s, giving up\n",
+	        c->ifname);
+	drop_address(c);
+	forget_lease(c);
+	c->exit_code = EXIT_USAGE;
+	return -1;
+}
+
 static int complete_bind(struct client *c, const struct dhcp_info *ack,
                          uint64_t ack_at) {
 	char a[INET_ADDRSTRLEN], s[INET_ADDRSTRLEN];
 
-	if (apply_lease(c->ifname, ack, &c->ap, lease_lifetime(ack, ack_at)) < 0) {
+	int r = apply_lease(c->ifname, ack, &c->ap, lease_lifetime(ack, ack_at));
+	if (r == APPLY_USAGE)
+		return config_error(c);
+	if (r < 0) {
 		fprintf(stderr, "could not apply lease on %s\n", c->ifname);
 		drop_address(c);
 		arp_close(c);
@@ -412,7 +425,10 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 			return defer_discovery(c);
 		}
 		rawsock_close(&c->rs);
-		if (apply_refresh(c->ifname, ack, &c->ap, lease_lifetime(ack, now)) < 0)
+		int r = apply_refresh(c->ifname, ack, &c->ap, lease_lifetime(ack, now));
+		if (r == APPLY_USAGE)
+			return config_error(c);
+		if (r < 0)
 			fprintf(stderr, "could not refresh address lifetime on %s\n",
 			        c->ifname);
 		c->lease = *ack;
@@ -721,11 +737,15 @@ static int on_timeout(struct client *c) {
 		if (++c->tries >= REQUEST_TRIES) {
 			if (c->applied) {
 				printf("no answer, keeping previous lease\n");
-				if (c->applied < 0 &&
-				    apply_lease(c->ifname, &c->lease, &c->ap,
-				                lifetime_until(c->expiry_at, now)) < 0) {
-					drop_address(c);
-					return defer_discovery(c);
+				if (c->applied < 0) {
+					int r = apply_lease(c->ifname, &c->lease, &c->ap,
+					                    lifetime_until(c->expiry_at, now));
+					if (r == APPLY_USAGE)
+						return config_error(c);
+					if (r < 0) {
+						drop_address(c);
+						return defer_discovery(c);
+					}
 				}
 				c->applied = 1;
 				if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0) {
