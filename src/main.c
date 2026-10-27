@@ -46,6 +46,13 @@ static int parse_table(const char *s, const char **out) {
 	return 0;
 }
 
+static int repeated(char *argv[], int i) {
+	for (int j = 2; j < i; j += 2)
+		if (strcmp(argv[j], argv[i]) == 0)
+			return 1;
+	return 0;
+}
+
 static void usage(void) {
 	fprintf(stderr, "usage: tundra-dhcpc <interface> [metric <n>] "
 	                "[carrier-grace <ms>] [lease-key <name>] [probe on|off] "
@@ -69,7 +76,11 @@ int main(int argc, char *argv[]) {
 	int probe = 1;
 	int secs_override = -1;
 	for (int i = 2; i < argc; i += 2) {
-		if (strcmp(argv[i], "metric") == 0 && !ap.has_metric) {
+		if (repeated(argv, i)) {
+			fprintf(stderr, "repeated option: %s\n", argv[i]);
+			return 2;
+		}
+		if (strcmp(argv[i], "metric") == 0) {
 			if (parse_uint(argv[i + 1], &ap.metric) < 0) {
 				fprintf(stderr, "invalid metric: %s\n", argv[i + 1]);
 				return 2;

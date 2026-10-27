@@ -124,7 +124,8 @@ claim() {
 
 start_dnsmasq() {
 	dnsmasq --interface="$BR" --bind-interfaces --port=0 --no-ping \
-		--dhcp-range="$NET.100,$NET.150,2m" --dhcp-option=3,"$NET.1" \
+		--dhcp-range="${DHCP_RANGE:-$NET.100,$NET.150,2m}" \
+		--dhcp-option=3,"${DHCP_ROUTER:-$NET.1}" \
 		--dhcp-leasefile="$WORK/leases" --pid-file="$WORK/dnsmasq.pid" "$@"
 	DNSMASQ_PID=$(cat "$WORK/dnsmasq.pid")
 }
