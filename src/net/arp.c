@@ -75,11 +75,14 @@ int arp_request(int fd, int ifindex, const unsigned char mac[ETH_ALEN],
 
 int arp_read(int fd, struct arp_msg *m) {
 	struct arp_pkt p;
-	ssize_t n = recv(fd, &p, sizeof(p), MSG_DONTWAIT);
+	struct sockaddr_ll from;
+	socklen_t fromlen = sizeof(from);
+	ssize_t n = recvfrom(fd, &p, sizeof(p), MSG_DONTWAIT,
+	                     (struct sockaddr *)&from, &fromlen);
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 			return 0;
-		perror("recv error");
+		perror("recvfrom error");
 		return -1;
 	}
 	if ((size_t)n < sizeof(p) || p.htype != htons(1) ||
@@ -88,6 +91,10 @@ int arp_read(int fd, struct arp_msg *m) {
 
 	m->oper = ntohs(p.oper);
 	memcpy(m->sha, p.sha, ETH_ALEN);
+	if (from.sll_halen == ETH_ALEN)
+		memcpy(m->src, from.sll_addr, ETH_ALEN);
+	else
+		memcpy(m->src, p.sha, ETH_ALEN);
 	m->spa = p.spa;
 	m->tpa = p.tpa;
 	return 1;

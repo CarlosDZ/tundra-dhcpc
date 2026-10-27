@@ -7,6 +7,7 @@
 struct arp_msg {
 	uint16_t oper;
 	unsigned char sha[ETH_ALEN];
+	unsigned char src[ETH_ALEN];
 	uint32_t spa;
 	uint32_t tpa;
 };
