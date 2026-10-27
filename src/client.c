@@ -99,24 +99,25 @@ static uint16_t msg_secs(const struct client *c) {
 	return elapsed_secs(c->xact_at, now_ms());
 }
 
+static int send_raw(struct client *c, const uint8_t *msg, size_t len,
+                    const char *what) {
+	if (rawsock_send(&c->rs, msg, len) == 0)
+		printf("%s sent on %s (xid 0x%08x)\n", what, c->ifname, ntohl(c->xid));
+	return 0;
+}
+
 static int send_discover(struct client *c) {
 	uint8_t msg[DHCP_MSG_LEN];
 	c->discover_secs = msg_secs(c);
 	size_t len = dhcp_build_discover(msg, c->xid, c->discover_secs, c->rs.mac);
-	if (rawsock_send(&c->rs, msg, len) < 0)
-		return 0;
-	printf("DHCPDISCOVER sent on %s (xid 0x%08x)\n", c->ifname, ntohl(c->xid));
-	return 0;
+	return send_raw(c, msg, len, "DHCPDISCOVER");
 }
 
 static int send_request(struct client *c, uint16_t secs, uint32_t addr,
                         uint32_t server) {
 	uint8_t msg[DHCP_MSG_LEN];
 	size_t len = dhcp_build_request(msg, c->xid, secs, c->rs.mac, addr, server);
-	if (rawsock_send(&c->rs, msg, len) < 0)
-		return 0;
-	printf("DHCPREQUEST sent\n");
-	return 0;
+	return send_raw(c, msg, len, "DHCPREQUEST");
 }
 
 static int send_renew(struct client *c, uint32_t dst) {
@@ -130,10 +131,7 @@ static int send_renew(struct client *c, uint32_t dst) {
 static int send_decline(struct client *c, uint32_t addr, uint32_t server) {
 	uint8_t msg[DHCP_MSG_LEN];
 	size_t len = dhcp_build_decline(msg, c->xid, c->rs.mac, addr, server);
-	if (rawsock_send(&c->rs, msg, len) < 0)
-		return 0;
-	printf("DHCPDECLINE sent\n");
-	return 0;
+	return send_raw(c, msg, len, "DHCPDECLINE");
 }
 
 static void arp_close(struct client *c) {
@@ -182,25 +180,39 @@ static void wait_carrier(struct client *c) {
 	c->deadline = UINT64_MAX;
 }
 
-static int start_discovery(struct client *c) {
-	forget_lease(c);
+static int begin(struct client *c) {
 	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
 		return -1;
-	if (new_xid(c) < 0)
+	return new_xid(c);
+}
+
+static int discover_in(struct client *c, uint64_t delay) {
+	forget_lease(c);
+	if (begin(c) < 0)
 		return -1;
 	c->state = SELECTING;
 	c->backoff = BACKOFF_START_MS;
-	c->xact_at = now_ms();
-	c->deadline = backoff_next(&c->backoff, c->xact_at);
-	return send_discover(c);
+	c->deadline = now_ms() + delay;
+	c->xact_at = c->deadline;
+	if (delay)
+		printf("retrying in %llu ms\n", (unsigned long long)delay);
+	return 0;
+}
+
+static int start_discovery(struct client *c) { return discover_in(c, 0); }
+
+static int retry_later(struct client *c) {
+	drop_address(c);
+	int r = discover_in(c, c->retry_ms);
+	if (c->retry_ms < BACKOFF_MAX_MS)
+		c->retry_ms *= 2;
+	return r;
 }
 
 static int start_reboot(struct client *c) {
 	char a[INET_ADDRSTRLEN];
 
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
-		return -1;
-	if (new_xid(c) < 0)
+	if (begin(c) < 0)
 		return -1;
 	c->state = REBOOTING;
 	c->tries = 0;
@@ -209,22 +221,6 @@ static int start_reboot(struct client *c) {
 	c->deadline = backoff_next(&c->backoff, c->xact_at);
 	printf("requesting previous address %s\n", ip_str(c->lease.yiaddr, a));
 	return send_request(c, msg_secs(c), c->lease.yiaddr, 0);
-}
-
-static int defer_discovery(struct client *c) {
-	forget_lease(c);
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
-		return -1;
-	if (new_xid(c) < 0)
-		return -1;
-	c->state = SELECTING;
-	c->backoff = BACKOFF_START_MS;
-	c->deadline = now_ms() + c->retry_ms;
-	c->xact_at = c->deadline;
-	printf("retrying in %llu ms\n", (unsigned long long)c->retry_ms);
-	if (c->retry_ms < BACKOFF_MAX_MS)
-		c->retry_ms *= 2;
-	return 0;
 }
 
 static int lose_lease(struct client *c) {
@@ -237,13 +233,24 @@ static int same_config(const struct dhcp_info *a, const struct dhcp_info *b) {
 	       a->router == b->router;
 }
 
+static int quit(struct client *c, int code) {
+	drop_address(c);
+	forget_lease(c);
+	c->exit_code = code;
+	return -1;
+}
+
+static int open_udp(struct client *c) {
+	if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0)
+		return -1;
+	rawsock_close(&c->rs);
+	return 0;
+}
+
 static int config_error(struct client *c) {
 	fprintf(stderr, "invalid configuration for tundra-ip on %s, giving up\n",
 	        c->ifname);
-	drop_address(c);
-	forget_lease(c);
-	c->exit_code = EXIT_USAGE;
-	return -1;
+	return quit(c, EXIT_USAGE);
 }
 
 static int complete_bind(struct client *c, const struct dhcp_info *ack,
@@ -256,17 +263,11 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
 		return config_error(c);
 	if (r < 0) {
 		fprintf(stderr, "could not apply lease on %s\n", c->ifname);
-		drop_address(c);
-		arp_close(c);
-		return defer_discovery(c);
+		return retry_later(c);
 	}
 	c->applied = 1;
-	if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0) {
-		drop_address(c);
-		arp_close(c);
-		return defer_discovery(c);
-	}
-	rawsock_close(&c->rs);
+	if (open_udp(c) < 0)
+		return retry_later(c);
 	c->retry_ms = BACKOFF_START_MS;
 	conflicts_new_address(&c->cs);
 
@@ -321,11 +322,8 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 
 	int same = c->applied && same_config(&c->lease, ack);
 	if (c->applied == 1 && same) {
-		if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0) {
-			drop_address(c);
-			return defer_discovery(c);
-		}
-		rawsock_close(&c->rs);
+		if (open_udp(c) < 0)
+			return retry_later(c);
 		int r = apply_refresh(c->ifname, ack, &c->ap,
 		                      lease_lifetime(ack, now, now_ms()));
 		if (r == APPLY_USAGE)
@@ -353,19 +351,6 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 	return start_probe(c, ack, now);
 }
 
-static int restart_after(struct client *c, uint64_t ms) {
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
-		return -1;
-	if (new_xid(c) < 0)
-		return -1;
-	c->state = SELECTING;
-	c->backoff = BACKOFF_START_MS;
-	c->deadline = now_ms() + ms;
-	c->xact_at = c->deadline;
-	printf("restarting discovery in %llu ms\n", (unsigned long long)ms);
-	return 0;
-}
-
 static const char *mac_str(const unsigned char m[ETH_ALEN], char buf[18]) {
 	snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3],
 	         m[4], m[5]);
@@ -390,11 +375,7 @@ static int raise_alert(struct client *c, const char *kind) {
 	if (conflicts_forged(cs))
 		fprintf(stderr, FORGED_HINT);
 	fprintf(stderr, "\n");
-
-	drop_address(c);
-	forget_lease(c);
-	c->exit_code = EXIT_ALERT;
-	return -1;
+	return quit(c, EXIT_ALERT);
 }
 
 static int raise_gw_alert(struct client *c) {
@@ -407,11 +388,7 @@ static int raise_gw_alert(struct client *c) {
 	if (c->gw.forged)
 		fprintf(stderr, FORGED_HINT);
 	fprintf(stderr, "\n");
-
-	drop_address(c);
-	forget_lease(c);
-	c->exit_code = EXIT_ALERT;
-	return -1;
+	return quit(c, EXIT_ALERT);
 }
 
 static int act(struct client *c, enum verdict v, enum alert_kind kind,
@@ -442,7 +419,7 @@ static int act(struct client *c, enum verdict v, enum alert_kind kind,
 	forget_lease(c);
 	if (v == V_ALERT)
 		return raise_alert(c, alert_name(kind));
-	return restart_after(c, scaled_ms(DECLINE_WAIT_S));
+	return discover_in(c, scaled_ms(DECLINE_WAIT_S));
 }
 
 static int on_gateway(struct client *c) {
@@ -537,6 +514,25 @@ static int on_carrier_down(struct client *c) {
 	return 0;
 }
 
+static int keep_previous(struct client *c, uint64_t now) {
+	printf("no answer, keeping previous lease\n");
+	if (c->applied < 0) {
+		int r = apply_lease(c->ifname, &c->lease, &c->ap,
+		                    lifetime_until(c->lt.expiry_at, now));
+		if (r == APPLY_USAGE)
+			return config_error(c);
+		if (r < 0)
+			return retry_later(c);
+	}
+	c->applied = 1;
+	if (open_udp(c) < 0)
+		return retry_later(c);
+	ensure_arp(c);
+	c->state = BOUND;
+	c->deadline = c->lt.t1_at;
+	return 0;
+}
+
 static int on_timeout(struct client *c) {
 	char s[INET_ADDRSTRLEN];
 	uint64_t now = now_ms();
@@ -567,35 +563,14 @@ static int on_timeout(struct client *c) {
 		return send_request(c, c->discover_secs, c->offer.yiaddr,
 		                    c->offer.server_id);
 	case REBOOTING:
-		if (++c->tries >= REQUEST_TRIES) {
-			if (c->applied) {
-				printf("no answer, keeping previous lease\n");
-				if (c->applied < 0) {
-					int r = apply_lease(c->ifname, &c->lease, &c->ap,
-					                    lifetime_until(c->lt.expiry_at, now));
-					if (r == APPLY_USAGE)
-						return config_error(c);
-					if (r < 0) {
-						drop_address(c);
-						return defer_discovery(c);
-					}
-				}
-				c->applied = 1;
-				if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0) {
-					drop_address(c);
-					return defer_discovery(c);
-				}
-				rawsock_close(&c->rs);
-				ensure_arp(c);
-				c->state = BOUND;
-				c->deadline = c->lt.t1_at;
-				return 0;
-			}
-			printf("no answer, restarting discovery\n");
-			return start_discovery(c);
+		if (++c->tries < REQUEST_TRIES) {
+			c->deadline = backoff_next(&c->backoff, now);
+			return send_request(c, msg_secs(c), c->lease.yiaddr, 0);
 		}
-		c->deadline = backoff_next(&c->backoff, now);
-		return send_request(c, msg_secs(c), c->lease.yiaddr, 0);
+		if (c->applied)
+			return keep_previous(c, now);
+		printf("no answer, restarting discovery\n");
+		return start_discovery(c);
 	case PROBING:
 		if (c->probes < PROBE_NUM) {
 			arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, 0,
@@ -698,14 +673,32 @@ static int on_reply(struct client *c, const struct dhcp_info *r) {
 	return -1;
 }
 
+static int dhcp_fd(const struct client *c) {
+	switch (c->state) {
+	case SELECTING:
+	case REQUESTING:
+	case REBOOTING:
+		return c->rs.fd;
+	case RENEWING:
+	case REBINDING:
+		return c->us.fd;
+	case WAITING:
+	case GRACE:
+	case PROBING:
+	case ANNOUNCING:
+	case BOUND:
+		break;
+	}
+	return -1;
+}
+
 static int on_packet(struct client *c) {
 	uint8_t buf[2048];
 	const uint8_t *msg = buf;
 	size_t len;
 	int r;
 
-	if (c->state == SELECTING || c->state == REQUESTING ||
-	    c->state == REBOOTING)
+	if (dhcp_fd(c) == c->rs.fd)
 		r = rawsock_recv(&c->rs, buf, sizeof(buf), 0, &msg, &len);
 	else
 		r = udpsock_recv(&c->us, buf, sizeof(buf), &len);
@@ -744,25 +737,6 @@ static int on_link(struct client *c) {
 		}
 		c->carrier = 0;
 		return on_carrier_down(c);
-	}
-	return -1;
-}
-
-static int dhcp_fd(const struct client *c) {
-	switch (c->state) {
-	case SELECTING:
-	case REQUESTING:
-	case REBOOTING:
-		return c->rs.fd;
-	case RENEWING:
-	case REBINDING:
-		return c->us.fd;
-	case WAITING:
-	case GRACE:
-	case PROBING:
-	case ANNOUNCING:
-	case BOUND:
-		break;
 	}
 	return -1;
 }
