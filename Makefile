@@ -41,7 +41,7 @@ TEST_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)-test\" \
             -DTUNDRA_IP_PATH=\"$(CURDIR)/tests/tools/tip-fail.sh\" \
             -DTUNDRA_DHCPC_TIME_SCALE=6
 
-$(TEST_BIN): $(SRCS) $(HDRS) Makefile metapkg
+$(TEST_BIN): FORCE
 	@mkdir -p $(dir $@)
 	$(CC) $(TUNDRA_STD) $(CFLAGS) $(TUNDRA_INC) $(TEST_DEFS) -o $@ $(SRCS)
 
@@ -54,13 +54,18 @@ UNIT_TESTS = $(patsubst tests/unit/%.c,$(TEST_BUILD)/unit/%,$(wildcard tests/uni
 
 $(TEST_BUILD)/unit/%: tests/unit/%.c tests/unit/test.h $(SRCS) $(HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) -Itests/unit -D_GNU_SOURCE -o $@ $<
+	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) -Itests/unit \
+		-D_GNU_SOURCE -DTUNDRA_DHCPC_TIME_SCALE=1 -o $@ $<
 
 check-unit: $(UNIT_TESTS)
 	@rc=0; for t in $(UNIT_TESTS); do echo "# $$t"; $$t || rc=1; done; exit $$rc
 
 check: check-unit $(TEST_BIN) $(TEST_TOOLS)
 	@sh tests/net/run.sh
+
+FORCE:
+
+.PHONY: install uninstall clean check check-unit FORCE
 
 PREFIX ?= /usr
 DESTDIR ?=
@@ -72,5 +77,3 @@ install: $(TARGET)
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 	rm -rf $(DESTDIR)$(PREFIX)/share/licenses/$(TARGET)
-
-.PHONY: install uninstall clean check check-unit
