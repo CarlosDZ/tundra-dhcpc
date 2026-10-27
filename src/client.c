@@ -3,6 +3,7 @@
 #include "arp.h"
 #include "conflict.h"
 #include "dhcp.h"
+#include "gateway.h"
 #include "lease.h"
 #include "link.h"
 #include "rawsock.h"
@@ -33,8 +34,6 @@
 #define EXIT_USAGE 2
 #define EXIT_ALERT 111
 #define DEFEND_INTERVAL_S 10
-#define GW_WAIT_MS 1000
-#define MAX_GW_MACS 4
 
 enum state {
 	WAITING,
@@ -64,12 +63,7 @@ struct client {
 	int probes;
 	int announces;
 	struct conflicts cs;
-	unsigned char gw_mac[ETH_ALEN];
-	int gw_known;
-	unsigned char gw_seen[MAX_GW_MACS][ETH_ALEN];
-	int ngw_seen;
-	int gw_forged;
-	uint64_t gw_until;
+	struct gateway gw;
 	int carrier;
 	int applied;
 	enum state state;
@@ -153,7 +147,7 @@ static void drop_address(struct client *c) {
 	if (c->applied)
 		apply_remove(c->ifname, &c->lease, &c->ap);
 	c->applied = 0;
-	c->gw_until = 0;
+	gateway_stop(&c->gw);
 	udpsock_close(&c->us);
 	arp_close(c);
 }
@@ -167,11 +161,9 @@ static int ensure_arp(struct client *c) {
 static void start_gw_check(struct client *c) {
 	if (!c->lease.router || ensure_arp(c) < 0)
 		return;
-	c->ngw_seen = 0;
-	c->gw_forged = 0;
+	gateway_start(&c->gw, now_ms());
 	arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
 	            c->lease.router);
-	c->gw_until = now_ms() + GW_WAIT_MS;
 }
 
 static void forget_lease(struct client *c) {
@@ -392,7 +384,7 @@ static int raise_alert(struct client *c, const char *kind) {
 	for (int i = 0; i < cs->n; i++)
 		fprintf(stderr, " %s (%s)", ip_str(cs->recs[i].addr, a),
 		        mac_str(cs->recs[i].mac, m));
-	if (c->gw_known && conflicts_has_mac(cs, c->gw_mac))
+	if (c->gw.known && conflicts_has_mac(cs, c->gw.mac))
 		fprintf(stderr, "; responder uses the gateway MAC (proxy ARP or "
 		                "gateway impersonation)");
 	if (conflicts_forged(cs))
@@ -410,9 +402,9 @@ static int raise_gw_alert(struct client *c) {
 
 	fprintf(stderr, "alert: gateway impersonation (D) on %s: %s claimed by",
 	        c->ifname, ip_str(c->lease.router, a));
-	for (int i = 0; i < c->ngw_seen; i++)
-		fprintf(stderr, " %s", mac_str(c->gw_seen[i], m));
-	if (c->gw_forged)
+	for (int i = 0; i < c->gw.nseen; i++)
+		fprintf(stderr, " %s", mac_str(c->gw.seen[i], m));
+	if (c->gw.forged)
 		fprintf(stderr, FORGED_HINT);
 	fprintf(stderr, "\n");
 
@@ -453,25 +445,17 @@ static int act(struct client *c, enum verdict v, enum alert_kind kind,
 	return restart_after(c, scaled_ms(DECLINE_WAIT_S));
 }
 
-static void gw_seen_add(struct client *c, const unsigned char mac[ETH_ALEN]) {
-	for (int i = 0; i < c->ngw_seen; i++)
-		if (memcmp(c->gw_seen[i], mac, ETH_ALEN) == 0)
-			return;
-	if (c->ngw_seen < MAX_GW_MACS)
-		memcpy(c->gw_seen[c->ngw_seen++], mac, ETH_ALEN);
-}
-
-static int gw_evaluate(struct client *c) {
+static int on_gateway(struct client *c) {
 	char m[18];
 
-	c->gw_until = 0;
-	if (c->ngw_seen >= 2)
+	switch (gateway_settle(&c->gw)) {
+	case GW_IMPERSONATED:
 		return raise_gw_alert(c);
-	if (c->ngw_seen == 1) {
-		if (!c->gw_known || memcmp(c->gw_mac, c->gw_seen[0], ETH_ALEN) != 0)
-			printf("gateway is at %s\n", mac_str(c->gw_seen[0], m));
-		memcpy(c->gw_mac, c->gw_seen[0], ETH_ALEN);
-		c->gw_known = 1;
+	case GW_LEARNED:
+		printf("gateway is at %s\n", mac_str(c->gw.mac, m));
+		return 0;
+	case GW_NONE:
+		break;
 	}
 	return 0;
 }
@@ -506,20 +490,9 @@ static int on_arp(struct client *c) {
 			return act(c, v, kind, c->lease.yiaddr, c->lease.server_id,
 			           msg.sha);
 		}
-		if (c->lease.router && msg.spa == c->lease.router) {
-			if (c->gw_until) {
-				c->gw_forged |= forged;
-				gw_seen_add(c, msg.sha);
-				return 0;
-			}
-			if (c->gw_known && memcmp(msg.sha, c->gw_mac, ETH_ALEN) != 0) {
-				c->ngw_seen = 0;
-				c->gw_forged = forged;
-				gw_seen_add(c, c->gw_mac);
-				gw_seen_add(c, msg.sha);
-				return raise_gw_alert(c);
-			}
-		}
+		if (c->lease.router && msg.spa == c->lease.router &&
+		    gateway_reply(&c->gw, msg.sha, forged) == GW_IMPERSONATED)
+			return raise_gw_alert(c);
 		return 0;
 	case WAITING:
 	case GRACE:
@@ -813,8 +786,8 @@ static int open_signals(void) {
 static int loop(struct client *c, int sfd) {
 	for (;;) {
 		uint64_t now = now_ms();
-		if (c->gw_until && now >= c->gw_until) {
-			if (gw_evaluate(c) < 0)
+		if (gateway_due(&c->gw, now)) {
+			if (on_gateway(c) < 0)
 				return c->exit_code;
 			continue;
 		}
@@ -825,8 +798,8 @@ static int loop(struct client *c, int sfd) {
 		}
 
 		uint64_t next = c->deadline;
-		if (c->gw_until && c->gw_until < next)
-			next = c->gw_until;
+		if (c->gw.until && c->gw.until < next)
+			next = c->gw.until;
 		uint64_t wait = next - now;
 		if (wait > MAX_WAIT_MS)
 			wait = MAX_WAIT_MS;
@@ -896,6 +869,7 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 	c.carrier = -1;
 	c.retry_ms = BACKOFF_START_MS;
 	conflicts_init(&c.cs, scaled_ms(DEFEND_INTERVAL_S), !probe);
+	gateway_init(&c.gw);
 	if (lease_path(c.lease_path, sizeof(c.lease_path), ifname, lease_key) < 0)
 		return 1;
 
