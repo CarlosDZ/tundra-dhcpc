@@ -1,6 +1,7 @@
 #include "client.h"
 #include "apply.h"
 #include "arp.h"
+#include "conflict.h"
 #include "dhcp.h"
 #include "lease.h"
 #include "link.h"
@@ -32,21 +33,8 @@
 #define EXIT_USAGE 2
 #define EXIT_ALERT 111
 #define DEFEND_INTERVAL_S 10
-#define CONFLICT_WINDOW_MS 300000
-#define MAX_RECORDS 16
-#define LIMIT_SAME_MAC 3
-#define LIMIT_PAIRS 10
-#define LIMIT_CLAIMS 3
 #define GW_WAIT_MS 1000
 #define MAX_GW_MACS 4
-
-struct conflict {
-	uint64_t at;
-	uint32_t addr;
-	unsigned char mac[ETH_ALEN];
-	int bound;
-	int forged;
-};
 
 enum state {
 	WAITING,
@@ -75,9 +63,7 @@ struct client {
 	int arpfd;
 	int probes;
 	int announces;
-	struct conflict recs[MAX_RECORDS];
-	int nrecs;
-	uint64_t last_defense;
+	struct conflicts cs;
 	unsigned char gw_mac[ETH_ALEN];
 	int gw_known;
 	unsigned char gw_seen[MAX_GW_MACS][ETH_ALEN];
@@ -290,7 +276,7 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
 	}
 	rawsock_close(&c->rs);
 	c->retry_ms = BACKOFF_START_MS;
-	c->last_defense = 0;
+	conflicts_new_address(&c->cs);
 
 	c->lease = *ack;
 	lease_timers(&c->lt, &c->lease, ack_at);
@@ -394,85 +380,22 @@ static const char *mac_str(const unsigned char m[ETH_ALEN], char buf[18]) {
 	return buf;
 }
 
-static int mac_invalid(const unsigned char m[ETH_ALEN]) {
-	static const unsigned char zero[ETH_ALEN];
-	return (m[0] & 1) || memcmp(m, zero, ETH_ALEN) == 0;
-}
-
-static void record(struct client *c, uint32_t addr,
-                   const unsigned char mac[ETH_ALEN], int bound, int forged) {
-	uint64_t now = now_ms();
-	int n = 0;
-	for (int i = 0; i < c->nrecs; i++)
-		if (now - c->recs[i].at < CONFLICT_WINDOW_MS)
-			c->recs[n++] = c->recs[i];
-	if (n == MAX_RECORDS) {
-		memmove(&c->recs[0], &c->recs[1],
-		        (MAX_RECORDS - 1) * sizeof(c->recs[0]));
-		n--;
-	}
-	c->recs[n].at = now;
-	c->recs[n].addr = addr;
-	memcpy(c->recs[n].mac, mac, ETH_ALEN);
-	c->recs[n].bound = bound;
-	c->recs[n].forged = forged;
-	c->nrecs = n + 1;
-}
-
-static int pair_seen(const struct client *c, int i) {
-	for (int j = 0; j < i; j++)
-		if (c->recs[j].addr == c->recs[i].addr &&
-		    memcmp(c->recs[j].mac, c->recs[i].mac, ETH_ALEN) == 0)
-			return 1;
-	return 0;
-}
-
-static const char *evaluate(const struct client *c,
-                            const unsigned char mac[ETH_ALEN]) {
-	if (mac_invalid(mac))
-		return "invalid responder MAC";
-
-	int addrs = 0, pairs = 0, claims = 0;
-	for (int i = 0; i < c->nrecs; i++) {
-		if (c->recs[i].bound)
-			claims++;
-		if (pair_seen(c, i))
-			continue;
-		pairs++;
-		if (memcmp(c->recs[i].mac, mac, ETH_ALEN) == 0)
-			addrs++;
-	}
-	if (addrs >= LIMIT_SAME_MAC)
-		return "single host claiming addresses (A)";
-	if (claims >= LIMIT_CLAIMS)
-		return "address in use repeatedly claimed (C)";
-	if (pairs >= LIMIT_PAIRS)
-		return "many hosts claiming addresses (B)";
-	return NULL;
-}
-
 #define FORGED_HINT                                                            \
 	"; ARP sender differs from frame source (crafted packet or proxying "      \
 	"device)"
 
 static int raise_alert(struct client *c, const char *kind) {
 	char a[INET_ADDRSTRLEN], m[18];
-	int gw_hint = 0;
-	int forged = 0;
+	const struct conflicts *cs = &c->cs;
 
 	fprintf(stderr, "alert: %s on %s:", kind, c->ifname);
-	for (int i = 0; i < c->nrecs; i++) {
-		fprintf(stderr, " %s (%s)", ip_str(c->recs[i].addr, a),
-		        mac_str(c->recs[i].mac, m));
-		if (c->gw_known && memcmp(c->recs[i].mac, c->gw_mac, ETH_ALEN) == 0)
-			gw_hint = 1;
-		if (c->recs[i].forged)
-			forged = 1;
-	}
-	if (gw_hint)
+	for (int i = 0; i < cs->n; i++)
+		fprintf(stderr, " %s (%s)", ip_str(cs->recs[i].addr, a),
+		        mac_str(cs->recs[i].mac, m));
+	if (c->gw_known && conflicts_has_mac(cs, c->gw_mac))
 		fprintf(stderr, "; responder uses the gateway MAC (proxy ARP or "
 		                "gateway impersonation)");
-	if (forged)
+	if (conflicts_forged(cs))
 		fprintf(stderr, FORGED_HINT);
 	fprintf(stderr, "\n");
 
@@ -499,64 +422,35 @@ static int raise_gw_alert(struct client *c) {
 	return -1;
 }
 
-static int give_up(struct client *c, uint32_t addr, uint32_t server,
-                   const unsigned char mac[ETH_ALEN], int after_bind,
-                   int forged) {
+static int act(struct client *c, enum verdict v, enum alert_kind kind,
+               uint32_t addr, uint32_t server,
+               const unsigned char mac[ETH_ALEN]) {
 	char a[INET_ADDRSTRLEN], m[18];
 
-	printf("address %s in use by %s\n", ip_str(addr, a), mac_str(mac, m));
-	record(c, addr, mac, after_bind, forged);
+	switch (v) {
+	case V_DEFEND:
+		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, addr, addr);
+		printf("defending address %s against %s\n", ip_str(addr, a),
+		       mac_str(mac, m));
+		return 0;
+	case V_HOLD:
+		printf("address %s claimed by %s, holding it\n", ip_str(addr, a),
+		       mac_str(mac, m));
+		return 0;
+	case V_GIVE_UP:
+	case V_ALERT:
+		break;
+	}
 
+	printf("address %s in use by %s\n", ip_str(addr, a), mac_str(mac, m));
 	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
 		return -1;
 	send_decline(c, addr, server);
 	drop_address(c);
 	forget_lease(c);
-
-	const char *kind = evaluate(c, mac);
-	if (kind)
-		return raise_alert(c, kind);
+	if (v == V_ALERT)
+		return raise_alert(c, alert_name(kind));
 	return restart_after(c, scaled_ms(DECLINE_WAIT_S));
-}
-
-static void defend(struct client *c, const unsigned char mac[ETH_ALEN],
-                   uint64_t now) {
-	char a[INET_ADDRSTRLEN], m[18];
-
-	arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
-	            c->lease.yiaddr);
-	c->last_defense = now;
-	printf("defending address %s against %s\n", ip_str(c->lease.yiaddr, a),
-	       mac_str(mac, m));
-}
-
-static int on_claim(struct client *c, const unsigned char mac[ETH_ALEN],
-                    int forged) {
-	char a[INET_ADDRSTRLEN], m[18];
-	uint64_t now = now_ms();
-	int recent =
-	    c->last_defense && now - c->last_defense < scaled_ms(DEFEND_INTERVAL_S);
-
-	if (!c->probe) {
-		record(c, c->lease.yiaddr, mac, 1, forged);
-		if (recent)
-			printf("address %s claimed by %s, holding it\n",
-			       ip_str(c->lease.yiaddr, a), mac_str(mac, m));
-		else
-			defend(c, mac, now);
-		return 0;
-	}
-
-	if (mac_invalid(mac) || recent)
-		return give_up(c, c->lease.yiaddr, c->lease.server_id, mac, 1, forged);
-
-	record(c, c->lease.yiaddr, mac, 1, forged);
-	const char *kind = evaluate(c, mac);
-	if (kind)
-		return raise_alert(c, kind);
-
-	defend(c, mac, now);
-	return 0;
 }
 
 static void gw_seen_add(struct client *c, const unsigned char mac[ETH_ALEN]) {
@@ -590,20 +484,28 @@ static int on_arp(struct client *c) {
 	if (memcmp(msg.sha, c->rs.mac, ETH_ALEN) == 0)
 		return 0;
 	int forged = memcmp(msg.sha, msg.src, ETH_ALEN) != 0;
+	enum alert_kind kind;
+	enum verdict v;
 
 	switch (c->state) {
 	case PROBING:
-		if (msg.spa == c->pending.yiaddr ||
-		    (msg.spa == 0 && msg.tpa == c->pending.yiaddr))
-			return give_up(c, c->pending.yiaddr, c->pending.server_id, msg.sha,
-			               0, forged);
-		return 0;
+		if (msg.spa != c->pending.yiaddr &&
+		    (msg.spa != 0 || msg.tpa != c->pending.yiaddr))
+			return 0;
+		v = conflict_probe(&c->cs, c->pending.yiaddr, msg.sha, forged, now_ms(),
+		                   &kind);
+		return act(c, v, kind, c->pending.yiaddr, c->pending.server_id,
+		           msg.sha);
 	case ANNOUNCING:
 	case BOUND:
 	case RENEWING:
 	case REBINDING:
-		if (msg.spa == c->lease.yiaddr)
-			return on_claim(c, msg.sha, forged);
+		if (msg.spa == c->lease.yiaddr) {
+			v = conflict_claim(&c->cs, c->lease.yiaddr, msg.sha, forged,
+			                   now_ms(), &kind);
+			return act(c, v, kind, c->lease.yiaddr, c->lease.server_id,
+			           msg.sha);
+		}
 		if (c->lease.router && msg.spa == c->lease.router) {
 			if (c->gw_until) {
 				c->gw_forged |= forged;
@@ -993,6 +895,7 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 	c.arpfd = -1;
 	c.carrier = -1;
 	c.retry_ms = BACKOFF_START_MS;
+	conflicts_init(&c.cs, scaled_ms(DEFEND_INTERVAL_S), !probe);
 	if (lease_path(c.lease_path, sizeof(c.lease_path), ifname, lease_key) < 0)
 		return 1;
 

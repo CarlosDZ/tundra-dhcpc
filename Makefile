@@ -10,15 +10,15 @@ TUNDRA_STD  = -std=c11
 TUNDRA_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)\" \
               -DTUNDRA_IP_PATH=\"$(TUNDRA_IP_PATH)\" \
               -DTUNDRA_DHCPC_TIME_SCALE=$(TUNDRA_DHCPC_TIME_SCALE)
-TUNDRA_INC  = -Isrc -Isrc/net -Isrc/dhcp
+TUNDRA_INC  = -Isrc -Isrc/net -Isrc/dhcp -Isrc/guard
 
 CFLAGS ?= -Wall -Wextra -O2
 
 TARGET = tundra-dhcpc
 
 BUILD = build
-SRCS = $(wildcard src/*.c src/net/*.c src/dhcp/*.c)
-HDRS = $(wildcard src/*.h src/net/*.h src/dhcp/*.h)
+SRCS = $(wildcard src/*.c src/net/*.c src/dhcp/*.c src/guard/*.c)
+HDRS = $(wildcard src/*.h src/net/*.h src/dhcp/*.h src/guard/*.h)
 OBJS = $(SRCS:src/%.c=$(BUILD)/%.o)
 DEPS = $(OBJS:.o=.d)
 
