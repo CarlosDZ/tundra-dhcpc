@@ -1,0 +1,37 @@
+#!/bin/bash
+# Sincroniza version, revision y depends del template con el metapkg antes de cada commit.
+set -euo pipefail
+
+METAPKG=metapkg
+TEMPLATE=template
+
+field() {
+	grep -m1 "^$1=" "$METAPKG" | cut -d= -f2- || true
+}
+
+metaver=$(field version)
+deps=$(field depends)
+
+if [[ ! $metaver =~ ^[0-9]+(\.[0-9]+)*_[0-9]+$ ]]; then
+	echo "pre-commit: invalid version in $METAPKG: '$metaver'" >&2
+	exit 1
+fi
+
+ver="${metaver%_*}"
+rev="${metaver##*_}"
+
+sed -i "s/^version=.*/version=${ver}/" "$TEMPLATE"
+sed -i "s/^revision=.*/revision=${rev}/" "$TEMPLATE"
+
+if [[ -z $deps ]]; then
+	sed -i '/^depends=/d' "$TEMPLATE"
+else
+	esc=$(printf '%s' "$deps" | sed 's/[&|\\]/\\&/g')
+	if grep -q '^depends=' "$TEMPLATE"; then
+		sed -i "s|^depends=.*|depends=\"${esc}\"|" "$TEMPLATE"
+	else
+		sed -i "/^revision=/a depends=\"${esc}\"" "$TEMPLATE"
+	fi
+fi
+
+git add "$TEMPLATE"
