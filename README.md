@@ -21,9 +21,10 @@ it runs until it is told to stop.
 - **It only touches what it put.** No flush on start. Everything it applies is
   done with idempotent `replace` operations and undone explicitly when the
   lease is lost.
-- **Hostile networks are assumed.** Every address is probed with ARP before use
-  and defended while in use; attacks are classified and reported with a
-  dedicated exit status.
+- **Protection lives in tundra-blueice.** Every address is probed before use by
+  `tundra-blueice-arp probe`; the client only acts on the result. Defending the
+  address while it is in use is the job of `tundra-blueice-arp watch`, launched
+  by the orchestrator.
 
 ## Requirements
 
@@ -31,6 +32,8 @@ it runs until it is told to stop.
 - Root (raw sockets and address configuration).
 - `tundra-ip` 1.7_1 or later, at the path fixed at build time (`TUNDRA_IP_PATH`,
   `/usr/bin/tundra-ip` by default).
+- `tundra-blueice-arp` 0.1_0 or later, at the path fixed at build time
+  (`TUNDRA_BLUEICE_ARP_PATH`, `/usr/bin/tundra-blueice-arp` by default).
 
 ## Usage
 
@@ -45,7 +48,7 @@ tundra-dhcpc --version
 | `metric <n>` | Metric of the address' connected route and of the default route | none (kernel default) |
 | `carrier-grace <ms>` | How long the address is kept after the link goes down (absorbs Wi-Fi micro-cuts) | `0` (removed at once) |
 | `lease-key <name>` | Extra key for the lease file, so one interface can remember a lease per network | none |
-| `probe on\|off` | `off` binds without ARP probing and defends the address forever (forced mode, see below) | `on` |
+| `probe on\|off` | `off` binds without probing the address first | `on` |
 | `secs <n>` | Fixed value for the `secs` field of every message (0-65535) | real elapsed seconds |
 | `table <table>` | Routing table of the interface (strong host model, see below) | none (`main` only) |
 | `rule-priority <n>` | Priority of the source rule (1-32765); requires `table` | `1000` |
@@ -75,6 +78,7 @@ the address and restarts discovery.
 |--------|--------|
 | SIGTERM, SIGINT | Exit keeping the address and the lease file; the next start resumes with INIT-REBOOT |
 | SIGUSR1 | Release: remove the address, routes and source rule, keep the lease file and exit |
+| SIGUSR2 | Conflict: send DHCPDECLINE for the address in use, remove it, forget the lease and discover again 10 s later |
 | SIGHUP, SIGPIPE | Ignored, so a closed terminal or log pipe never leaves state behind |
 
 If the interface is removed, the kernel deletes its addresses and routes; the
@@ -108,36 +112,21 @@ With `table <t>`, besides the address, the client installs:
 All of it is removed explicitly when the lease is lost. Traffic leaving with the
 interface's address therefore always leaves through that interface.
 
-### ARP probing and defense
+### Address probing
 
-Before using an address the client probes it (RFC 5227: three probes 1-2 s
-apart, then 2 s of silence) and, if nobody claims it, announces it twice. A
-conflict sends DHCPDECLINE and retries 10 s later. While the address is in use,
-a claim from another host is answered with an announcement; a second claim
-within 10 s makes the client give the address up.
+Before using a new address the client runs
+`tundra-blueice-arp probe <interface> <address>` as a child, without blocking
+its loop, and acts on the result:
 
-With `probe off` (forced mode) the address is bound without probing and is
-defended forever: claims are answered at most once per defense interval and
-the client never gives the address up.
+| Probe result | Client |
+|--------------|--------|
+| `free` | Binds the address |
+| `taken mac <mac> src <mac>` | Sends DHCPDECLINE and discovers again 10 s later |
+| Exit `111` | Sends DHCPDECLINE and exits with `111`. The alert line was already written by the probe on the shared stderr |
+| Exit `2` | Exits with `2` |
+| Exit `1`, killed, or no result within 30 s | Retries with backoff |
 
-### Attack detection
-
-Conflicts are recorded over a sliding 5-minute window. The client stops with
-exit status **111** and a single `alert:` line on stderr when it sees:
-
-| Case | Condition |
-|------|-----------|
-| A | One MAC claiming 3 different addresses offered to us |
-| B | 10 distinct (MAC, address) pairs claiming our addresses |
-| C | 3 claims on the address in use |
-| D | Two different MACs answering for the gateway address |
-| Invalid MAC | A claim from a multicast, broadcast or all-zero MAC (immediate) |
-
-The alert may carry two hints: the responder uses the gateway's MAC (proxy ARP
-or gateway impersonation), and the ARP sender differs from the Ethernet frame
-source (crafted packet or proxying device). The address and the lease are
-removed before exiting. In forced mode cases A, B and C are only logged; D still
-raises the alert.
+The probe's stdout goes to the client; its stderr is the client's own.
 
 ### Robustness
 
@@ -156,7 +145,7 @@ raises the alert.
 | `0` | Stopped by SIGTERM or SIGINT (address and lease file kept, the next start resumes with INIT-REBOOT), or released by SIGUSR1 |
 | `1` | Operational failure: interface removed, socket error, `tundra-ip` could not be run, or SIGUSR1 could not remove what was applied |
 | `2` | Invalid usage or configuration: bad arguments, invalid table, or `tundra-ip` rejected the configuration (its own exit status 2). Never retried |
-| `111` | Alert: attack detected (see [Attack detection](#attack-detection)) |
+| `111` | Alert from `tundra-blueice-arp probe`, propagated (see [Address probing](#address-probing)) |
 
 Operational failures of `tundra-ip` (its exit status 1) are not fatal: the
 client undoes what it applied and retries with backoff.
@@ -167,6 +156,7 @@ client undoes what it applied and retries with backoff.
 |------|---------|
 | `/run/tundra/dhcpc/<if>[-<key>].lease` | Current lease (`key=value`, written atomically) |
 | `TUNDRA_IP_PATH` (`/usr/bin/tundra-ip`) | Layer 1 tool invoked to apply the lease |
+| `TUNDRA_BLUEICE_ARP_PATH` (`/usr/bin/tundra-blueice-arp`) | ARP sensor invoked to probe an address |
 | `/etc/tundra/network/route_tables` | Table names, read by `tundra-ip` only |
 
 Lease file fields: `address`, `mask`, `server`, `router`, `dns` (up to three,
@@ -180,7 +170,8 @@ make
 make install PREFIX=/usr DESTDIR=<staging>
 ```
 
-`TUNDRA_IP_PATH` sets where `tundra-ip` is looked up
+`TUNDRA_IP_PATH` and `TUNDRA_BLUEICE_ARP_PATH` set where `tundra-ip` and
+`tundra-blueice-arp` are looked up
 (`make TUNDRA_IP_PATH=/usr/local/bin/tundra-ip`). The Makefile honours the
 packager's `CPPFLAGS`, `CFLAGS` and `LDFLAGS`.
 
@@ -199,6 +190,10 @@ make check
   host's interfaces. They need root (the runner re-executes itself with `sudo`),
   `iproute2`, `dnsmasq` and an installed `tundra-ip` (`TIP_REAL` overrides its
   path, `/usr/local/bin/tundra-ip` by default).
+- The probe is replaced by `tests/tools/biarp-fake.sh`, which answers `free`
+  unless a scenario asks for something else. `t-sensor.sh` runs against the real
+  sensor: `BIARP_REAL`, or `../tundra-blueice-arp/build/test/tundra-blueice-arp`
+  when it exists; otherwise it is skipped.
 - The test binary is built with protocol timers divided by 6, so a full run
   takes about four minutes.
 
@@ -208,8 +203,6 @@ make check
   routes, but the source rule and the table's default route remain. They are
   harmless (the rule points to an address that no longer exists) and are
   replaced on the next start with the same lease.
-- The interface MAC is read when the raw socket is opened; if it changes while
-  bound, announcements and defense keep the old one until the next discovery.
 
 ## Currently unsupported
 

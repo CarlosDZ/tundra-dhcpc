@@ -1,11 +1,9 @@
 #include "client.h"
 #include "apply.h"
-#include "arp.h"
-#include "conflict.h"
 #include "dhcp.h"
-#include "gateway.h"
 #include "lease.h"
 #include "link.h"
+#include "probe.h"
 #include "rawsock.h"
 #include "timing.h"
 #include "udpsock.h"
@@ -19,21 +17,15 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/signalfd.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define REQUEST_TRIES 4
 #define MAX_WAIT_MS 60000
-#define PROBE_WAIT_MS 1000
-#define PROBE_NUM 3
-#define PROBE_MIN_MS 1000
-#define PROBE_MAX_MS 2000
-#define ANNOUNCE_WAIT_MS 2000
-#define ANNOUNCE_NUM 2
-#define ANNOUNCE_INTERVAL_MS 2000
+#define PROBE_TIMEOUT_S 30
 #define DECLINE_WAIT_S 10
 #define EXIT_USAGE 2
 #define EXIT_ALERT 111
-#define DEFEND_INTERVAL_S 10
 
 enum state {
 	WAITING,
@@ -42,7 +34,6 @@ enum state {
 	REQUESTING,
 	REBOOTING,
 	PROBING,
-	ANNOUNCING,
 	BOUND,
 	RENEWING,
 	REBINDING
@@ -59,11 +50,8 @@ struct client {
 	struct rawsock rs;
 	struct udpsock us;
 	int linkfd;
-	int arpfd;
-	int probes;
-	int announces;
-	struct conflicts cs;
-	struct gateway gw;
+	pid_t probe_pid;
+	int probe_out;
 	int carrier;
 	int applied;
 	enum state state;
@@ -134,11 +122,11 @@ static int send_decline(struct client *c, uint32_t addr, uint32_t server) {
 	return send_raw(c, msg, len, "DHCPDECLINE");
 }
 
-static void arp_close(struct client *c) {
-	if (c->arpfd >= 0) {
-		close(c->arpfd);
-		c->arpfd = -1;
-	}
+static void stop_probe(struct client *c) {
+	if (c->probe_pid > 0)
+		probe_stop(c->probe_pid, c->probe_out);
+	c->probe_pid = 0;
+	c->probe_out = -1;
 }
 
 static int drop_address(struct client *c) {
@@ -146,24 +134,8 @@ static int drop_address(struct client *c) {
 	if (c->applied)
 		r = apply_remove(c->ifname, &c->lease, &c->ap);
 	c->applied = 0;
-	gateway_stop(&c->gw);
 	udpsock_close(&c->us);
-	arp_close(c);
 	return r;
-}
-
-static int ensure_arp(struct client *c) {
-	if (c->arpfd < 0)
-		c->arpfd = arp_open(c->rs.ifindex);
-	return c->arpfd < 0 ? -1 : 0;
-}
-
-static void start_gw_check(struct client *c) {
-	if (!c->lease.router || ensure_arp(c) < 0)
-		return;
-	gateway_start(&c->gw, now_ms());
-	arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
-	            c->lease.router);
 }
 
 static void forget_lease(struct client *c) {
@@ -176,8 +148,8 @@ static void save_lease(struct client *c) {
 }
 
 static void wait_carrier(struct client *c) {
+	stop_probe(c);
 	rawsock_close(&c->rs);
-	arp_close(c);
 	c->state = WAITING;
 	c->deadline = UINT64_MAX;
 }
@@ -189,6 +161,7 @@ static int begin(struct client *c) {
 }
 
 static int discover_in(struct client *c, uint64_t delay) {
+	stop_probe(c);
 	forget_lease(c);
 	if (begin(c) < 0)
 		return -1;
@@ -214,6 +187,7 @@ static int retry_later(struct client *c) {
 static int start_reboot(struct client *c) {
 	char a[INET_ADDRSTRLEN];
 
+	stop_probe(c);
 	if (begin(c) < 0)
 		return -1;
 	c->state = REBOOTING;
@@ -236,6 +210,7 @@ static int same_config(const struct dhcp_info *a, const struct dhcp_info *b) {
 }
 
 static int quit(struct client *c, int code) {
+	stop_probe(c);
 	drop_address(c);
 	forget_lease(c);
 	c->exit_code = code;
@@ -271,23 +246,12 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
 	if (open_udp(c) < 0)
 		return retry_later(c);
 	c->retry_ms = BACKOFF_START_MS;
-	conflicts_new_address(&c->cs);
 
 	c->lease = *ack;
 	lease_timers(&c->lt, &c->lease, ack_at);
 	save_lease(c);
 	printf("bound to %s from %s, lease %u s\n", ip_str(ack->yiaddr, a),
 	       ip_str(ack->server_id, s), ntohl(ack->lease));
-
-	if (ensure_arp(c) == 0) {
-		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
-		            c->lease.yiaddr);
-		c->announces = 1;
-		c->state = ANNOUNCING;
-		c->deadline = now_ms() + ANNOUNCE_INTERVAL_MS;
-		start_gw_check(c);
-		return 0;
-	}
 	c->state = BOUND;
 	c->deadline = c->lt.t1_at;
 	return 0;
@@ -299,17 +263,13 @@ static int start_probe(struct client *c, const struct dhcp_info *ack,
 
 	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
 		return -1;
-	if (c->arpfd < 0) {
-		c->arpfd = arp_open(c->rs.ifindex);
-		if (c->arpfd < 0)
-			return -1;
-	}
 	c->pending = *ack;
 	c->ack_at = now;
-	c->probes = 0;
-	c->state = PROBING;
-	c->deadline = now + random_ms(0, PROBE_WAIT_MS);
 	printf("probing address %s\n", ip_str(ack->yiaddr, a));
+	if (probe_spawn(c->ifname, ack->yiaddr, &c->probe_pid, &c->probe_out) < 0)
+		return retry_later(c);
+	c->state = PROBING;
+	c->deadline = now + scaled_ms(PROBE_TIMEOUT_S);
 	return 0;
 }
 
@@ -340,7 +300,6 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 		save_lease(c);
 		printf("renewed %s from %s, lease %u s\n", ip_str(ack->yiaddr, a),
 		       ip_str(ack->server_id, s), ntohl(ack->lease));
-		start_gw_check(c);
 		return 0;
 	}
 
@@ -353,134 +312,68 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 	return start_probe(c, ack, now);
 }
 
-static const char *mac_str(const unsigned char m[ETH_ALEN], char buf[18]) {
-	snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3],
-	         m[4], m[5]);
-	return buf;
-}
-
-#define FORGED_HINT                                                            \
-	"; ARP sender differs from frame source (crafted packet or proxying "      \
-	"device)"
-
-static int raise_alert(struct client *c, const char *kind) {
-	char a[INET_ADDRSTRLEN], m[18];
-	const struct conflicts *cs = &c->cs;
-
-	fprintf(stderr, "alert: %s on %s:", kind, c->ifname);
-	for (int i = 0; i < cs->n; i++)
-		fprintf(stderr, " %s (%s)", ip_str(cs->recs[i].addr, a),
-		        mac_str(cs->recs[i].mac, m));
-	if (c->gw.known && conflicts_has_mac(cs, c->gw.mac))
-		fprintf(stderr, "; responder uses the gateway MAC (proxy ARP or "
-		                "gateway impersonation)");
-	if (conflicts_forged(cs))
-		fprintf(stderr, FORGED_HINT);
-	fprintf(stderr, "\n");
-	return quit(c, EXIT_ALERT);
-}
-
-static int raise_gw_alert(struct client *c) {
-	char a[INET_ADDRSTRLEN], m[18];
-
-	fprintf(stderr, "alert: gateway impersonation (D) on %s: %s claimed by",
-	        c->ifname, ip_str(c->lease.router, a));
-	for (int i = 0; i < c->gw.nseen; i++)
-		fprintf(stderr, " %s", mac_str(c->gw.seen[i], m));
-	if (c->gw.forged)
-		fprintf(stderr, FORGED_HINT);
-	fprintf(stderr, "\n");
-	return quit(c, EXIT_ALERT);
-}
-
-static int act(struct client *c, enum verdict v, enum alert_kind kind,
-               uint32_t addr, uint32_t server,
-               const unsigned char mac[ETH_ALEN]) {
-	char a[INET_ADDRSTRLEN], m[18];
-
-	switch (v) {
-	case V_DEFEND:
-		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, addr, addr);
-		printf("defending address %s against %s\n", ip_str(addr, a),
-		       mac_str(mac, m));
-		return 0;
-	case V_HOLD:
-		printf("address %s claimed by %s, holding it\n", ip_str(addr, a),
-		       mac_str(mac, m));
-		return 0;
-	case V_GIVE_UP:
-	case V_ALERT:
-		break;
-	}
-
-	printf("address %s in use by %s\n", ip_str(addr, a), mac_str(mac, m));
+static int decline(struct client *c, uint32_t addr, uint32_t server) {
 	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
 		return -1;
-	send_decline(c, addr, server);
+	return send_decline(c, addr, server);
+}
+
+static int on_probe(struct client *c, int status) {
+	char out[PROBE_OUT_MAX], mac[18] = "", a[INET_ADDRSTRLEN];
+
+	probe_drain(c->probe_out, out, sizeof(out));
+	close(c->probe_out);
+	c->probe_pid = 0;
+	c->probe_out = -1;
+
+	switch (probe_judge(status, out, mac)) {
+	case PR_FREE:
+		return complete_bind(c, &c->pending, c->ack_at);
+	case PR_TAKEN:
+		printf("address %s in use by %s\n", ip_str(c->pending.yiaddr, a), mac);
+		decline(c, c->pending.yiaddr, c->pending.server_id);
+		return discover_in(c, scaled_ms(DECLINE_WAIT_S));
+	case PR_ALERT:
+		decline(c, c->pending.yiaddr, c->pending.server_id);
+		return quit(c, EXIT_ALERT);
+	case PR_CONFIG:
+		fprintf(stderr,
+		        "tundra-blueice-arp rejected its arguments, giving up\n");
+		return quit(c, EXIT_USAGE);
+	case PR_RETRY:
+		break;
+	}
+	fprintf(stderr, "could not probe address %s on %s\n",
+	        ip_str(c->pending.yiaddr, a), c->ifname);
+	return retry_later(c);
+}
+
+static int on_child(struct client *c) {
+	int status;
+	if (c->probe_pid <= 0)
+		return 0;
+	pid_t r = waitpid(c->probe_pid, &status, WNOHANG);
+	if (r == 0 || (r < 0 && errno == EINTR))
+		return 0;
+	if (r < 0) {
+		perror("waitpid error");
+		status = 0x7f00;
+	}
+	return on_probe(c, status);
+}
+
+static int on_conflict(struct client *c) {
+	char a[INET_ADDRSTRLEN];
+
+	if (!c->applied) {
+		printf("no address in use on %s, ignoring SIGUSR2\n", c->ifname);
+		return 0;
+	}
+	printf("address %s in conflict, declining it\n",
+	       ip_str(c->lease.yiaddr, a));
+	decline(c, c->lease.yiaddr, c->lease.server_id);
 	drop_address(c);
-	forget_lease(c);
-	if (v == V_ALERT)
-		return raise_alert(c, alert_name(kind));
 	return discover_in(c, scaled_ms(DECLINE_WAIT_S));
-}
-
-static int on_gateway(struct client *c) {
-	char m[18];
-
-	switch (gateway_settle(&c->gw)) {
-	case GW_IMPERSONATED:
-		return raise_gw_alert(c);
-	case GW_LEARNED:
-		printf("gateway is at %s\n", mac_str(c->gw.mac, m));
-		return 0;
-	case GW_NONE:
-		break;
-	}
-	return 0;
-}
-
-static int on_arp(struct client *c) {
-	struct arp_msg msg;
-	int r = arp_read(c->arpfd, &msg);
-	if (r <= 0)
-		return r;
-	if (memcmp(msg.sha, c->rs.mac, ETH_ALEN) == 0)
-		return 0;
-	int forged = memcmp(msg.sha, msg.src, ETH_ALEN) != 0;
-	enum alert_kind kind;
-	enum verdict v;
-
-	switch (c->state) {
-	case PROBING:
-		if (msg.spa != c->pending.yiaddr &&
-		    (msg.spa != 0 || msg.tpa != c->pending.yiaddr))
-			return 0;
-		v = conflict_probe(&c->cs, c->pending.yiaddr, msg.sha, forged, now_ms(),
-		                   &kind);
-		return act(c, v, kind, c->pending.yiaddr, c->pending.server_id,
-		           msg.sha);
-	case ANNOUNCING:
-	case BOUND:
-	case RENEWING:
-	case REBINDING:
-		if (msg.spa == c->lease.yiaddr) {
-			v = conflict_claim(&c->cs, c->lease.yiaddr, msg.sha, forged,
-			                   now_ms(), &kind);
-			return act(c, v, kind, c->lease.yiaddr, c->lease.server_id,
-			           msg.sha);
-		}
-		if (c->lease.router && msg.spa == c->lease.router &&
-		    gateway_reply(&c->gw, msg.sha, forged) == GW_IMPERSONATED)
-			return raise_gw_alert(c);
-		return 0;
-	case WAITING:
-	case GRACE:
-	case SELECTING:
-	case REQUESTING:
-	case REBOOTING:
-		break;
-	}
-	return 0;
 }
 
 static int on_carrier_up(struct client *c) {
@@ -507,7 +400,6 @@ static int on_carrier_down(struct client *c) {
 	}
 
 	rawsock_close(&c->rs);
-	arp_close(c);
 	c->state = GRACE;
 	c->deadline = now + c->grace_ms;
 	if (c->deadline > c->lt.expiry_at)
@@ -529,7 +421,6 @@ static int keep_previous(struct client *c, uint64_t now) {
 	c->applied = 1;
 	if (open_udp(c) < 0)
 		return retry_later(c);
-	ensure_arp(c);
 	c->state = BOUND;
 	c->deadline = c->lt.t1_at;
 	return 0;
@@ -574,27 +465,9 @@ static int on_timeout(struct client *c) {
 		printf("no answer, restarting discovery\n");
 		return start_discovery(c);
 	case PROBING:
-		if (c->probes < PROBE_NUM) {
-			arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, 0,
-			            c->pending.yiaddr);
-			c->probes++;
-			if (c->probes < PROBE_NUM)
-				c->deadline = now + random_ms(PROBE_MIN_MS, PROBE_MAX_MS);
-			else
-				c->deadline = now + ANNOUNCE_WAIT_MS;
-			return 0;
-		}
-		return complete_bind(c, &c->pending, c->ack_at);
-	case ANNOUNCING:
-		arp_request(c->arpfd, c->rs.ifindex, c->rs.mac, c->lease.yiaddr,
-		            c->lease.yiaddr);
-		if (++c->announces < ANNOUNCE_NUM) {
-			c->deadline = now + ANNOUNCE_INTERVAL_MS;
-			return 0;
-		}
-		c->state = BOUND;
-		c->deadline = c->lt.t1_at;
-		return 0;
+		fprintf(stderr, "probe of %s timed out\n",
+		        ip_str(c->pending.yiaddr, s));
+		return retry_later(c);
 	case BOUND:
 		if (new_xid(c) < 0)
 			return -1;
@@ -631,7 +504,6 @@ static int on_reply(struct client *c, const struct dhcp_info *r) {
 	case WAITING:
 	case GRACE:
 	case PROBING:
-	case ANNOUNCING:
 	case BOUND:
 		return 0;
 	case SELECTING:
@@ -687,7 +559,6 @@ static int dhcp_fd(const struct client *c) {
 	case WAITING:
 	case GRACE:
 	case PROBING:
-	case ANNOUNCING:
 	case BOUND:
 		break;
 	}
@@ -752,6 +623,8 @@ static int open_signals(void) {
 	sigaddset(&mask, SIGTERM);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGUSR1);
+	sigaddset(&mask, SIGUSR2);
+	sigaddset(&mask, SIGCHLD);
 	if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
 		perror("sigprocmask error");
 		return -1;
@@ -766,29 +639,20 @@ static int open_signals(void) {
 static int loop(struct client *c, int sfd) {
 	for (;;) {
 		uint64_t now = now_ms();
-		if (gateway_due(&c->gw, now)) {
-			if (on_gateway(c) < 0)
-				return c->exit_code;
-			continue;
-		}
 		if (now >= c->deadline) {
 			if (on_timeout(c) < 0)
 				return c->exit_code;
 			continue;
 		}
 
-		uint64_t next = c->deadline;
-		if (c->gw.until && c->gw.until < next)
-			next = c->gw.until;
-		uint64_t wait = next - now;
+		uint64_t wait = c->deadline - now;
 		if (wait > MAX_WAIT_MS)
 			wait = MAX_WAIT_MS;
 
-		struct pollfd pfd[4] = {{.fd = dhcp_fd(c), .events = POLLIN},
+		struct pollfd pfd[3] = {{.fd = dhcp_fd(c), .events = POLLIN},
 		                        {.fd = sfd, .events = POLLIN},
-		                        {.fd = c->linkfd, .events = POLLIN},
-		                        {.fd = c->arpfd, .events = POLLIN}};
-		if (poll(pfd, 4, (int)wait) < 0) {
+		                        {.fd = c->linkfd, .events = POLLIN}};
+		if (poll(pfd, 3, (int)wait) < 0) {
 			if (errno == EINTR)
 				continue;
 			perror("poll error");
@@ -799,20 +663,28 @@ static int loop(struct client *c, int sfd) {
 			struct signalfd_siginfo si;
 			if (read(sfd, &si, sizeof(si)) != sizeof(si))
 				return 0;
-			if (si.ssi_signo == SIGUSR1) {
+			int r;
+			switch (si.ssi_signo) {
+			case SIGCHLD:
+				r = on_child(c);
+				break;
+			case SIGUSR2:
+				r = on_conflict(c);
+				break;
+			case SIGUSR1:
+				stop_probe(c);
 				printf("releasing address on %s\n", c->ifname);
 				return drop_address(c) < 0 ? 1 : 0;
+			default:
+				printf("received %s, exiting\n", strsignal((int)si.ssi_signo));
+				return 0;
 			}
-			printf("received %s, exiting\n", strsignal((int)si.ssi_signo));
-			return 0;
-		}
-		if (pfd[2].revents & POLLIN) {
-			if (on_link(c) < 0)
+			if (r < 0)
 				return c->exit_code;
 			continue;
 		}
-		if (pfd[3].revents & POLLIN) {
-			if (on_arp(c) < 0)
+		if (pfd[2].revents & POLLIN) {
+			if (on_link(c) < 0)
 				return c->exit_code;
 			continue;
 		}
@@ -850,11 +722,9 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 	c.secs_override = secs_override;
 	c.exit_code = 1;
 	c.us.fd = -1;
-	c.arpfd = -1;
+	c.probe_out = -1;
 	c.carrier = -1;
 	c.retry_ms = BACKOFF_START_MS;
-	conflicts_init(&c.cs, scaled_ms(DEFEND_INTERVAL_S), !probe);
-	gateway_init(&c.gw);
 	if (lease_path(c.lease_path, sizeof(c.lease_path), ifname, lease_key) < 0)
 		return 1;
 
@@ -874,9 +744,9 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 		}
 	}
 
+	stop_probe(&c);
 	rawsock_close(&c.rs);
 	udpsock_close(&c.us);
-	arp_close(&c);
 	close(sfd);
 	return ret;
 }
