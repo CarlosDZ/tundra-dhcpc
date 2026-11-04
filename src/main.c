@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,9 @@ static void usage(void) {
 }
 
 int main(int argc, char *argv[]) {
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+
 	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
 		printf("tundra-dhcpc %s\n", TUNDRA_DHCPC_VERSION);
 		return 0;

@@ -48,6 +48,8 @@ static int run(const struct cmd *c, int quiet) {
 		sigset_t none;
 		sigemptyset(&none);
 		sigprocmask(SIG_SETMASK, &none, NULL);
+		signal(SIGHUP, SIG_DFL);
+		signal(SIGPIPE, SIG_DFL);
 		if (quiet) {
 			int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
 			if (fd >= 0) {
@@ -138,13 +140,13 @@ static int addr_replace(const char *ifname, const struct apply_opts *opts,
 	return run(&c, 0);
 }
 
-static void rule_del(const struct apply_opts *opts, const struct addrs *a) {
+static int rule_del(const struct apply_opts *opts, const struct addrs *a) {
 	struct cmd c;
 	cmd_init(&c, "rule", "del");
 	cmd_pair(&c, "from", a->host);
 	cmd_pair(&c, "table", opts->table);
 	cmd_pair(&c, "priority", a->priority);
-	run(&c, 1);
+	return run(&c, 1);
 }
 
 int apply_check_table(const char *table) {
@@ -239,15 +241,16 @@ int apply_refresh(const char *ifname, const struct dhcp_info *info,
 	return addr_replace(ifname, opts, &a, lifetime);
 }
 
-void apply_remove(const char *ifname, const struct dhcp_info *info,
-                  const struct apply_opts *opts) {
+int apply_remove(const char *ifname, const struct dhcp_info *info,
+                 const struct apply_opts *opts) {
 	struct addrs a;
 	if (format_addrs(info, opts, &a) < 0)
-		return;
+		return APPLY_FAIL;
 
 	struct cmd c;
+	int rule = 0;
 	if (opts->table) {
-		rule_del(opts, &a);
+		rule = rule_del(opts, &a);
 		default_del(ifname, opts->table);
 
 		cmd_init(&c, "route", "del");
@@ -262,5 +265,16 @@ void apply_remove(const char *ifname, const struct dhcp_info *info,
 	cmd_init(&c, "addr", "del");
 	cmd_add(&c, a.cidr);
 	cmd_pair(&c, "on", ifname);
-	run(&c, 0);
+	int addr = run(&c, 0);
+	return rule < 0 || addr < 0 ? APPLY_FAIL : 0;
+}
+
+int apply_remove_rule(const struct dhcp_info *info,
+                      const struct apply_opts *opts) {
+	struct addrs a;
+	if (!opts->table)
+		return 0;
+	if (format_addrs(info, opts, &a) < 0)
+		return APPLY_FAIL;
+	return rule_del(opts, &a) < 0 ? APPLY_FAIL : 0;
 }

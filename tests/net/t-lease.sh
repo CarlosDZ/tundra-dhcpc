@@ -29,4 +29,12 @@ start_client metric 200 lease-key home
 expect_log "bound to $NET." 15 "binds with lease-key"
 check "lease file named after interface and key" test -s "$LEASES/$IF-home.lease"
 stop_client
+
+setup
+stop_dnsmasq
+start_dnsmasq --dhcp-option=6,9.9.9.9,1.1.1.1,8.8.8.8
+start_client metric 200 probe off
+expect_log "bound to $NET." 15 "binds with three DNS servers"
+check "lease file stores every DNS server" grep -qx 'dns=9.9.9.9,1.1.1.1,8.8.8.8' "$LEASES/$IF.lease"
+stop_client
 summary

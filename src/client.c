@@ -141,13 +141,15 @@ static void arp_close(struct client *c) {
 	}
 }
 
-static void drop_address(struct client *c) {
+static int drop_address(struct client *c) {
+	int r = 0;
 	if (c->applied)
-		apply_remove(c->ifname, &c->lease, &c->ap);
+		r = apply_remove(c->ifname, &c->lease, &c->ap);
 	c->applied = 0;
 	gateway_stop(&c->gw);
 	udpsock_close(&c->us);
 	arp_close(c);
+	return r;
 }
 
 static int ensure_arp(struct client *c) {
@@ -721,6 +723,9 @@ static int on_link(struct client *c) {
 		return 0;
 	case LINK_GONE:
 		fprintf(stderr, "interface %s removed\n", c->ifname);
+		if (c->applied)
+			apply_remove_rule(&c->lease, &c->ap);
+		c->applied = 0;
 		return -1;
 	case LINK_UP:
 		if (c->carrier == 1)
@@ -746,6 +751,7 @@ static int open_signals(void) {
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGTERM);
 	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGUSR1);
 	if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
 		perror("sigprocmask error");
 		return -1;
@@ -791,8 +797,13 @@ static int loop(struct client *c, int sfd) {
 
 		if (pfd[1].revents & POLLIN) {
 			struct signalfd_siginfo si;
-			if (read(sfd, &si, sizeof(si)) == sizeof(si))
-				printf("received %s, exiting\n", strsignal((int)si.ssi_signo));
+			if (read(sfd, &si, sizeof(si)) != sizeof(si))
+				return 0;
+			if (si.ssi_signo == SIGUSR1) {
+				printf("releasing address on %s\n", c->ifname);
+				return drop_address(c) < 0 ? 1 : 0;
+			}
+			printf("received %s, exiting\n", strsignal((int)si.ssi_signo));
 			return 0;
 		}
 		if (pfd[2].revents & POLLIN) {
