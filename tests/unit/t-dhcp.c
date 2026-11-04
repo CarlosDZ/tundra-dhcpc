@@ -61,7 +61,7 @@ static void test_parse(void) {
 	CHECK(i.server_id == inet_addr("10.0.0.1"), "server id");
 	CHECK(i.mask == inet_addr("255.255.255.0"), "mask");
 	CHECK(i.router == inet_addr("10.0.0.1"), "router");
-	CHECK(i.dns == inet_addr("9.9.9.9"), "dns");
+	CHECK(i.dns[0] == inet_addr("9.9.9.9") && i.dns[1] == 0, "dns");
 	CHECK(ntohl(i.lease) == 3600 && ntohl(i.t1) == 1800 && ntohl(i.t2) == 3150,
 	      "lease, T1 and T2");
 
@@ -84,7 +84,7 @@ static void test_parse(void) {
 	const uint8_t hostile[] = {53, 1, 5, 6, 200, 1, 2, 3, 4};
 	reply(b, hostile, sizeof(hostile));
 	CHECK(dhcp_parse_reply(b, 240 + sizeof(hostile), htonl(XID), &i) == 0 &&
-	          i.dns == 0,
+	          i.dns[0] == 0,
 	      "ignores an option longer than the message");
 
 	const uint8_t cut[] = {6, 4, 1, 2, 3, 4, 53};
@@ -106,12 +106,12 @@ static void test_overload(void) {
 	CHECK(dhcp_parse_reply(b, 300, htonl(XID), &i) == 0 &&
 	          i.mask == inet_addr("255.255.255.0") &&
 	          i.router == inet_addr("10.0.0.1") &&
-	          i.dns == inet_addr("9.9.9.9"),
+	          i.dns[0] == inet_addr("9.9.9.9"),
 	      "overload 3 reads file and sname");
 
 	b[245] = 1;
 	CHECK(dhcp_parse_reply(b, 300, htonl(XID), &i) == 0 && i.router &&
-	          i.dns == 0,
+	          i.dns[0] == 0,
 	      "overload 1 reads file only");
 
 	b[245] = 0;
@@ -124,9 +124,35 @@ static void test_overload(void) {
 	      "ignores a hostile length inside file");
 }
 
+static void test_dns(void) {
+	uint8_t b[DHCP_MSG_LEN];
+	struct dhcp_info i;
+
+	const uint8_t four[] = {53, 1, 5, 6, 16, 9, 9, 9, 9, 1, 1,
+	                        1,  1, 8, 8, 8,  8, 4, 4, 4, 4, 255};
+	reply(b, four, sizeof(four));
+	CHECK(dhcp_parse_reply(b, 300, htonl(XID), &i) == 0 &&
+	          i.dns[0] == inet_addr("9.9.9.9") &&
+	          i.dns[1] == inet_addr("1.1.1.1") &&
+	          i.dns[2] == inet_addr("8.8.8.8"),
+	      "keeps the first three DNS servers");
+
+	const uint8_t odd[] = {53, 1, 5, 6, 6, 9, 9, 9, 9, 1, 1, 255};
+	reply(b, odd, sizeof(odd));
+	CHECK(dhcp_parse_reply(b, 300, htonl(XID), &i) == 0 &&
+	          i.dns[0] == inet_addr("9.9.9.9") && i.dns[1] == 0,
+	      "ignores a trailing partial address");
+
+	const uint8_t shorty[] = {53, 1, 5, 6, 3, 9, 9, 9, 255};
+	reply(b, shorty, sizeof(shorty));
+	CHECK(dhcp_parse_reply(b, 300, htonl(XID), &i) == 0 && i.dns[0] == 0,
+	      "ignores a DNS option shorter than one address");
+}
+
 int main(void) {
 	test_build();
 	test_parse();
 	test_overload();
+	test_dns();
 	return test_summary();
 }

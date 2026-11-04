@@ -108,6 +108,14 @@ static void opt_get_addr(const struct opt_zones *z, uint8_t code,
 		memcpy(out, v, 4);
 }
 
+static void opt_get_addrs(const struct opt_zones *z, uint8_t code,
+                          uint32_t *out, int max) {
+	uint8_t l;
+	const uint8_t *v = zones_find(z, code, &l);
+	for (int i = 0; v && i < max && (i + 1) * 4 <= l; i++)
+		memcpy(&out[i], v + i * 4, 4);
+}
+
 static uint8_t *msg_init(struct dhcp_msg *m, uint32_t xid, uint16_t secs,
                          const unsigned char mac[ETH_ALEN], uint8_t type) {
 	memset(m, 0, sizeof(*m));
@@ -206,7 +214,7 @@ int dhcp_parse_reply(const uint8_t *msg, size_t len, uint32_t xid,
 	opt_get_addr(&z, OPT_SERVER_ID, &info->server_id);
 	opt_get_addr(&z, OPT_SUBNET_MASK, &info->mask);
 	opt_get_addr(&z, OPT_ROUTER, &info->router);
-	opt_get_addr(&z, OPT_DNS, &info->dns);
+	opt_get_addrs(&z, OPT_DNS, info->dns, DHCP_MAX_DNS);
 	opt_get_addr(&z, OPT_LEASE_TIME, &info->lease);
 	opt_get_addr(&z, OPT_RENEWAL_TIME, &info->t1);
 	opt_get_addr(&z, OPT_REBINDING_TIME, &info->t2);

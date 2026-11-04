@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define DHCP_MSG_LEN 548
+#define DHCP_MAX_DNS 3
 
 enum {
 	DHCPDISCOVER = 1,
@@ -22,7 +23,7 @@ struct dhcp_info {
 	uint32_t server_id;
 	uint32_t mask;
 	uint32_t router;
-	uint32_t dns;
+	uint32_t dns[DHCP_MAX_DNS];
 	uint32_t lease;
 	uint32_t t1;
 	uint32_t t2;

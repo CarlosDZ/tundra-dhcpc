@@ -39,6 +39,18 @@ static void put_addr(FILE *f, const char *key, uint32_t a) {
 	fprintf(f, "%s=%s\n", key, s);
 }
 
+static void put_dns(FILE *f, const uint32_t dns[DHCP_MAX_DNS]) {
+	char s[INET_ADDRSTRLEN];
+	if (!dns[0])
+		return;
+	fputs("dns=", f);
+	for (int i = 0; i < DHCP_MAX_DNS && dns[i]; i++) {
+		inet_ntop(AF_INET, &dns[i], s, sizeof(s));
+		fprintf(f, "%s%s", i ? "," : "", s);
+	}
+	fputc('\n', f);
+}
+
 int lease_save(const char *path, const struct dhcp_info *info,
                const struct lease_times *lt) {
 	if (make_dir(RUN_DIR, 0755) < 0 || make_dir(LEASE_DIR, 0700) < 0)
@@ -67,8 +79,7 @@ int lease_save(const char *path, const struct dhcp_info *info,
 	put_addr(f, "server", info->server_id);
 	if (info->router)
 		put_addr(f, "router", info->router);
-	if (info->dns)
-		put_addr(f, "dns", info->dns);
+	put_dns(f, info->dns);
 	fprintf(f, "lease=%u\n", ntohl(info->lease));
 	fprintf(f, "t1_at=%llu\n", (unsigned long long)lt->t1_at);
 	fprintf(f, "t2_at=%llu\n", (unsigned long long)lt->t2_at);
@@ -99,6 +110,16 @@ static int parse_addr(const char *s, uint32_t *out) {
 		return -1;
 	*out = a.s_addr;
 	return 0;
+}
+
+static int parse_dns(char *s, uint32_t dns[DHCP_MAX_DNS]) {
+	int n = 0;
+	for (char *tok = strtok(s, ","); tok; tok = strtok(NULL, ",")) {
+		if (n == DHCP_MAX_DNS || parse_addr(tok, &dns[n]) < 0)
+			return -1;
+		n++;
+	}
+	return n ? 0 : -1;
 }
 
 static int parse_u64(const char *s, uint64_t *out) {
@@ -156,7 +177,7 @@ int lease_load(const char *path, struct dhcp_info *info,
 		} else if (strcmp(line, "router") == 0) {
 			r = parse_addr(val, &info->router);
 		} else if (strcmp(line, "dns") == 0) {
-			r = parse_addr(val, &info->dns);
+			r = parse_dns(val, info->dns);
 		} else if (strcmp(line, "lease") == 0) {
 			r = parse_u64(val, &n);
 			if (r == 0 && (n == 0 || n > UINT32_MAX))

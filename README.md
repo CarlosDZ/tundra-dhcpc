@@ -69,6 +69,18 @@ expires. Losing carrier removes the address (or keeps it for `carrier-grace`);
 recovering it confirms the previous lease with INIT-REBOOT. A NAK always clears
 the address and restarts discovery.
 
+### Signals
+
+| Signal | Effect |
+|--------|--------|
+| SIGTERM, SIGINT | Exit keeping the address and the lease file; the next start resumes with INIT-REBOOT |
+| SIGUSR1 | Release: remove the address, routes and source rule, keep the lease file and exit |
+| SIGHUP, SIGPIPE | Ignored, so a closed terminal or log pipe never leaves state behind |
+
+If the interface is removed, the kernel deletes its addresses and routes; the
+client removes the source rule, which belongs to no interface, keeps the lease
+file and exits with `1`.
+
 ### Lease persistence
 
 The current lease is stored in `/run/tundra/dhcpc/<interface>.lease` (or
@@ -141,8 +153,8 @@ raises the alert.
 
 | Code | Meaning |
 |------|---------|
-| `0` | Stopped by SIGTERM or SIGINT. The address and the lease file are kept, so the next start resumes with INIT-REBOOT |
-| `1` | Operational failure: interface removed, socket error, `tundra-ip` could not be run |
+| `0` | Stopped by SIGTERM or SIGINT (address and lease file kept, the next start resumes with INIT-REBOOT), or released by SIGUSR1 |
+| `1` | Operational failure: interface removed, socket error, `tundra-ip` could not be run, or SIGUSR1 could not remove what was applied |
 | `2` | Invalid usage or configuration: bad arguments, invalid table, or `tundra-ip` rejected the configuration (its own exit status 2). Never retried |
 | `111` | Alert: attack detected (see [Attack detection](#attack-detection)) |
 
@@ -157,8 +169,9 @@ client undoes what it applied and retries with backoff.
 | `TUNDRA_IP_PATH` (`/usr/bin/tundra-ip`) | Layer 1 tool invoked to apply the lease |
 | `/etc/tundra/network/route_tables` | Table names, read by `tundra-ip` only |
 
-Lease file fields: `address`, `mask`, `server`, `router`, `dns`, `lease`,
-`t1_at`, `t2_at`, `expiry_at` (times in milliseconds of `CLOCK_BOOTTIME`).
+Lease file fields: `address`, `mask`, `server`, `router`, `dns` (up to three,
+comma separated), `lease`, `t1_at`, `t2_at`, `expiry_at` (times in milliseconds of
+`CLOCK_BOOTTIME`).
 
 ## Building
 
@@ -203,8 +216,9 @@ make check
 Planned or pending design decisions:
 
 - IPv6 (DHCPv6, SLAAC).
-- Applying DNS servers; only the first DNS server and router are kept.
+- Applying DNS servers (up to three are stored in the lease); only the first
+  router is kept.
 - Options 12 (hostname) and 61 (client identifier).
-- DHCPRELEASE on exit, SIGHUP handling and structured logging.
+- DHCPRELEASE on exit and structured logging.
 - Waiting for a removed interface to come back.
 - Dropping privileges to `CAP_NET_RAW` + `CAP_NET_ADMIN`.

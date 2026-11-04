@@ -1,7 +1,7 @@
 name=tundra-dhcpc
 author=CarlosDZ
-version=1.0_0
-v_date=2026-10-29
+version=1.1_0
+v_date=2026-11-03
 license=GPL-3.0-or-later
 depends=tundra-ip>=1.7_1
 description=Minimal DHCPv4 client for Tundra OS
