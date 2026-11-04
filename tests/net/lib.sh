@@ -13,7 +13,9 @@ WORK=$(mktemp -d /tmp/tdc-test.XXXXXX)
 LOG=$WORK/client.log
 LEASES=/run/tundra/dhcpc
 TIP_FAIL=$WORK/fail-route
-export TIP_FAIL
+BIARP_FAKE=$WORK/biarp
+SENSOR_HISTORY=/run/tundra/blueice/arp
+export TIP_FAIL BIARP_FAKE
 
 PASS=0
 FAIL=0
@@ -118,10 +120,6 @@ no_addr() {
 	[ -z "$(ns_addr)" ]
 }
 
-claim() {
-	in_evil "$TOOLS/arpsend" "$EVIF" "$@"
-}
-
 start_dnsmasq() {
 	dnsmasq --interface="$BR" --bind-interfaces --port=0 --no-ping \
 		--dhcp-range="${DHCP_RANGE:-$NET.100,$NET.150,2m}" \
@@ -188,7 +186,8 @@ teardown_net() {
 	ip link del "${IF}p" 2>/dev/null
 	ip link del "${EVIF}p" 2>/dev/null
 	ip link del "$BR" 2>/dev/null
-	rm -f "$LEASES/$IF.lease" "$LEASES/$IF"-*.lease
+	rm -f "$LEASES/$IF.lease" "$LEASES/$IF"-*.lease "$BIARP_FAKE"
+	rm -f "$SENSOR_HISTORY/$IF" "$SENSOR_HISTORY/$IF.lock"
 	return 0
 }
 

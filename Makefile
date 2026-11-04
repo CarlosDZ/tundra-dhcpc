@@ -4,21 +4,23 @@ CC = gcc
 VERSION = $(shell grep '^version=' metapkg | cut -d= -f2)
 
 TUNDRA_IP_PATH ?= /usr/bin/tundra-ip
+TUNDRA_BLUEICE_ARP_PATH ?= /usr/bin/tundra-blueice-arp
 TUNDRA_DHCPC_TIME_SCALE ?= 1
 
 TUNDRA_STD  = -std=c11
 TUNDRA_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)\" \
               -DTUNDRA_IP_PATH=\"$(TUNDRA_IP_PATH)\" \
+              -DTUNDRA_BLUEICE_ARP_PATH=\"$(TUNDRA_BLUEICE_ARP_PATH)\" \
               -DTUNDRA_DHCPC_TIME_SCALE=$(TUNDRA_DHCPC_TIME_SCALE)
-TUNDRA_INC  = -Isrc -Isrc/net -Isrc/dhcp -Isrc/guard
+TUNDRA_INC  = -Isrc -Isrc/net -Isrc/dhcp
 
 CFLAGS ?= -Wall -Wextra -O2
 
 TARGET = tundra-dhcpc
 
 BUILD = build
-SRCS = $(wildcard src/*.c src/net/*.c src/dhcp/*.c src/guard/*.c)
-HDRS = $(wildcard src/*.h src/net/*.h src/dhcp/*.h src/guard/*.h)
+SRCS = $(wildcard src/*.c src/net/*.c src/dhcp/*.c)
+HDRS = $(wildcard src/*.h src/net/*.h src/dhcp/*.h)
 OBJS = $(SRCS:src/%.c=$(BUILD)/%.o)
 DEPS = $(OBJS:.o=.d)
 
@@ -44,6 +46,7 @@ TEST_BIN = $(TEST_BUILD)/tundra-dhcpc
 TEST_TOOLS = $(patsubst tests/tools/%.c,$(TEST_BUILD)/tools/%,$(wildcard tests/tools/*.c))
 TEST_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)-test\" \
             -DTUNDRA_IP_PATH=\"$(CURDIR)/tests/tools/tip-fail.sh\" \
+            -DTUNDRA_BLUEICE_ARP_PATH=\"$(CURDIR)/tests/tools/biarp-fake.sh\" \
             -DTUNDRA_DHCPC_TIME_SCALE=6
 
 $(TEST_BIN): FORCE
@@ -60,7 +63,8 @@ UNIT_TESTS = $(patsubst tests/unit/%.c,$(TEST_BUILD)/unit/%,$(wildcard tests/uni
 $(TEST_BUILD)/unit/%: tests/unit/%.c tests/unit/test.h $(SRCS) $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(TUNDRA_STD) $(CFLAGS) $(UNIT_FLAGS) $(TUNDRA_INC) -Itests/unit \
-		-D_GNU_SOURCE -DTUNDRA_DHCPC_TIME_SCALE=1 -o $@ $<
+		-D_GNU_SOURCE -DTUNDRA_DHCPC_TIME_SCALE=1 \
+		-DTUNDRA_BLUEICE_ARP_PATH=\"/nonexistent\" -o $@ $<
 
 check-unit: $(UNIT_TESTS)
 	@rc=0; for t in $(UNIT_TESTS); do echo "# $$t"; $$t || rc=1; done; exit $$rc

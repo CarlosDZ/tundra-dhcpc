@@ -1,5 +1,5 @@
 #!/bin/sh
-[ "$(id -u)" -eq 0 ] || exec sudo env TIP_REAL="${TIP_REAL:-}" sh "$0" "$@"
+[ "$(id -u)" -eq 0 ] || exec sudo env TIP_REAL="${TIP_REAL:-}" BIARP_REAL="${BIARP_REAL:-}" sh "$0" "$@"
 cd "$(dirname "$0")/../.." || exit 1
 
 for dep in ip dnsmasq; do

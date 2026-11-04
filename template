@@ -1,10 +1,10 @@
 # Template file for 'tundra-dhcpc'
 pkgname=tundra-dhcpc
-version=1.1
+version=2.0
 revision=0
 build_style=gnu-makefile
 make_check_target=check-unit
-depends="tundra-ip>=1.7_1"
+depends="tundra-ip>=1.7_1 tundra-blueice-arp>=0.1_0"
 short_desc="Minimal DHCPv4 client developed for Tundra OS"
 maintainer="CarlosDZ <none@example.com>"
 license="GPL-3.0-or-later"
