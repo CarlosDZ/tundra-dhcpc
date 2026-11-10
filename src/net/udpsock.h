@@ -6,10 +6,13 @@
 
 struct udpsock {
 	int fd;
+	int live;
 };
 
 int udpsock_open(struct udpsock *us, const char *ifname);
 void udpsock_close(struct udpsock *us);
+void udpsock_pause(struct udpsock *us);
+void udpsock_resume(struct udpsock *us);
 
 int udpsock_send(const struct udpsock *us, uint32_t dst, const void *payload,
                  size_t len);
