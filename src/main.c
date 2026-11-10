@@ -1,5 +1,6 @@
 #include "apply.h"
 #include "client.h"
+#include "parent.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -61,8 +62,12 @@ static void usage(void) {
 }
 
 int main(int argc, char *argv[]) {
+	static char outbuf[BUFSIZ];
+
 	signal(SIGHUP, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
+	parent_bind();
+	parent_announce();
 
 	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
 		printf("tundra-dhcpc %s\n", TUNDRA_DHCPC_VERSION);
@@ -151,6 +156,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	setvbuf(stdout, NULL, _IOLBF, 0);
+	/* a static buffer: the worker cannot allocate one once confined */
+	setvbuf(stdout, outbuf, _IOLBF, sizeof(outbuf));
 	return client_run(argv[1], &ap, grace_ms, lease_key, probe, secs_override);
 }

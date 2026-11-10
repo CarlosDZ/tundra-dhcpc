@@ -1,8 +1,9 @@
 #include "timing.h"
 
 #include <arpa/inet.h>
-#include <sys/random.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 uint64_t now_ms(void) {
 	struct timespec ts;
@@ -14,9 +15,15 @@ uint64_t scaled_ms(uint64_t secs) {
 	return secs * 1000 / TUNDRA_DHCPC_TIME_SCALE;
 }
 
+/* The raw system call: the glibc wrapper may go through the vDSO, which maps
+ * memory and blocks signals behind the seccomp filter's back. */
+int random_bytes(void *buf, size_t len) {
+	return syscall(SYS_getrandom, buf, len, 0) == (long)len ? 0 : -1;
+}
+
 uint64_t random_ms(uint64_t min, uint64_t max) {
 	uint32_t r = 0;
-	if (getrandom(&r, sizeof(r), 0) != sizeof(r))
+	if (random_bytes(&r, sizeof(r)) < 0)
 		return min;
 	return min + r % (max - min + 1);
 }

@@ -3,8 +3,11 @@
 #include "dhcp.h"
 #include "lease.h"
 #include "link.h"
+#include "monitor.h"
 #include "probe.h"
 #include "rawsock.h"
+#include "request.h"
+#include "sandbox.h"
 #include "timing.h"
 #include "udpsock.h"
 
@@ -15,9 +18,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/random.h>
+#include <sys/prctl.h>
 #include <sys/signalfd.h>
-#include <sys/wait.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define REQUEST_TRIES 4
@@ -50,8 +53,8 @@ struct client {
 	struct rawsock rs;
 	struct udpsock us;
 	int linkfd;
-	pid_t probe_pid;
-	int probe_out;
+	struct req_chan ch;
+	int probing;
 	int carrier;
 	int applied;
 	enum state state;
@@ -74,7 +77,7 @@ static const char *ip_str(uint32_t a, char buf[INET_ADDRSTRLEN]) {
 }
 
 static int new_xid(struct client *c) {
-	if (getrandom(&c->xid, sizeof(c->xid), 0) != sizeof(c->xid)) {
+	if (random_bytes(&c->xid, sizeof(c->xid)) < 0) {
 		perror("getrandom error");
 		return -1;
 	}
@@ -123,39 +126,38 @@ static int send_decline(struct client *c, uint32_t addr, uint32_t server) {
 }
 
 static void stop_probe(struct client *c) {
-	if (c->probe_pid > 0)
-		probe_stop(c->probe_pid, c->probe_out);
-	c->probe_pid = 0;
-	c->probe_out = -1;
+	if (c->probing)
+		req_probe_stop(&c->ch);
+	c->probing = 0;
 }
 
 static int drop_address(struct client *c) {
 	int r = 0;
 	if (c->applied)
-		r = apply_remove(c->ifname, &c->lease, &c->ap);
+		r = req_remove(&c->ch, &c->lease);
 	c->applied = 0;
-	udpsock_close(&c->us);
+	udpsock_pause(&c->us);
 	return r;
 }
 
 static void forget_lease(struct client *c) {
 	memset(&c->lease, 0, sizeof(c->lease));
-	lease_remove(c->lease_path);
+	req_lease_remove(&c->ch);
 }
 
 static void save_lease(struct client *c) {
-	lease_save(c->lease_path, &c->lease, &c->lt);
+	req_lease_save(&c->ch, &c->lease, &c->lt);
 }
 
 static void wait_carrier(struct client *c) {
 	stop_probe(c);
-	rawsock_close(&c->rs);
+	rawsock_pause(&c->rs);
 	c->state = WAITING;
 	c->deadline = UINT64_MAX;
 }
 
 static int begin(struct client *c) {
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
+	if (rawsock_resume(&c->rs, c->ifname) < 0)
 		return -1;
 	return new_xid(c);
 }
@@ -218,9 +220,8 @@ static int quit(struct client *c, int code) {
 }
 
 static int open_udp(struct client *c) {
-	if (c->us.fd < 0 && udpsock_open(&c->us, c->ifname) < 0)
-		return -1;
-	rawsock_close(&c->rs);
+	udpsock_resume(&c->us);
+	rawsock_pause(&c->rs);
 	return 0;
 }
 
@@ -234,8 +235,7 @@ static int complete_bind(struct client *c, const struct dhcp_info *ack,
                          uint64_t ack_at) {
 	char a[INET_ADDRSTRLEN], s[INET_ADDRSTRLEN];
 
-	int r = apply_lease(c->ifname, ack, &c->ap,
-	                    lease_lifetime(ack, ack_at, now_ms()));
+	int r = req_apply(&c->ch, ack, lease_lifetime(ack, ack_at, now_ms()));
 	if (r == APPLY_USAGE)
 		return config_error(c);
 	if (r < 0) {
@@ -261,13 +261,14 @@ static int start_probe(struct client *c, const struct dhcp_info *ack,
                        uint64_t now) {
 	char a[INET_ADDRSTRLEN];
 
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
+	if (rawsock_resume(&c->rs, c->ifname) < 0)
 		return -1;
 	c->pending = *ack;
 	c->ack_at = now;
 	printf("probing address %s\n", ip_str(ack->yiaddr, a));
-	if (probe_spawn(c->ifname, ack->yiaddr, &c->probe_pid, &c->probe_out) < 0)
+	if (req_probe_start(&c->ch, ack->yiaddr) < 0)
 		return retry_later(c);
+	c->probing = 1;
 	c->state = PROBING;
 	c->deadline = now + scaled_ms(PROBE_TIMEOUT_S);
 	return 0;
@@ -286,8 +287,7 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 	if (c->applied == 1 && same) {
 		if (open_udp(c) < 0)
 			return retry_later(c);
-		int r = apply_refresh(c->ifname, ack, &c->ap,
-		                      lease_lifetime(ack, now, now_ms()));
+		int r = req_refresh(&c->ch, ack, lease_lifetime(ack, now, now_ms()));
 		if (r == APPLY_USAGE)
 			return config_error(c);
 		if (r < 0)
@@ -313,18 +313,15 @@ static int bind_lease(struct client *c, const struct dhcp_info *ack) {
 }
 
 static int decline(struct client *c, uint32_t addr, uint32_t server) {
-	if (c->rs.fd < 0 && rawsock_open(&c->rs, c->ifname) < 0)
+	if (rawsock_resume(&c->rs, c->ifname) < 0)
 		return -1;
 	return send_decline(c, addr, server);
 }
 
-static int on_probe(struct client *c, int status) {
-	char out[PROBE_OUT_MAX], mac[18] = "", a[INET_ADDRSTRLEN];
+static int on_probe(struct client *c, int status, const char *out) {
+	char mac[18] = "", a[INET_ADDRSTRLEN];
 
-	probe_drain(c->probe_out, out, sizeof(out));
-	close(c->probe_out);
-	c->probe_pid = 0;
-	c->probe_out = -1;
+	c->probing = 0;
 
 	switch (probe_judge(status, out, mac)) {
 	case PR_FREE:
@@ -348,18 +345,14 @@ static int on_probe(struct client *c, int status) {
 	return retry_later(c);
 }
 
-static int on_child(struct client *c) {
+static int on_monitor(struct client *c) {
+	char out[MON_OUT_MAX];
 	int status;
-	if (c->probe_pid <= 0)
-		return 0;
-	pid_t r = waitpid(c->probe_pid, &status, WNOHANG);
-	if (r == 0 || (r < 0 && errno == EINTR))
-		return 0;
-	if (r < 0) {
-		perror("waitpid error");
-		status = 0x7f00;
-	}
-	return on_probe(c, status);
+
+	int r = req_probe_done(&c->ch, &status, out);
+	if (r <= 0 || !c->probing)
+		return r < 0 ? -1 : 0;
+	return on_probe(c, status, out);
 }
 
 static int on_conflict(struct client *c) {
@@ -399,7 +392,7 @@ static int on_carrier_down(struct client *c) {
 		return 0;
 	}
 
-	rawsock_close(&c->rs);
+	rawsock_pause(&c->rs);
 	c->state = GRACE;
 	c->deadline = now + c->grace_ms;
 	if (c->deadline > c->lt.expiry_at)
@@ -411,8 +404,8 @@ static int on_carrier_down(struct client *c) {
 static int keep_previous(struct client *c, uint64_t now) {
 	printf("no answer, keeping previous lease\n");
 	if (c->applied < 0) {
-		int r = apply_lease(c->ifname, &c->lease, &c->ap,
-		                    lifetime_until(c->lt.expiry_at, now));
+		int r =
+		    req_apply(&c->ch, &c->lease, lifetime_until(c->lt.expiry_at, now));
 		if (r == APPLY_USAGE)
 			return config_error(c);
 		if (r < 0)
@@ -594,8 +587,8 @@ static int on_link(struct client *c) {
 		return 0;
 	case LINK_GONE:
 		fprintf(stderr, "interface %s removed\n", c->ifname);
-		if (c->applied)
-			apply_remove_rule(&c->lease, &c->ap);
+		if (c->applied && c->ap.table)
+			req_remove_rule(&c->ch, &c->lease);
 		c->applied = 0;
 		return -1;
 	case LINK_UP:
@@ -638,6 +631,12 @@ static int open_signals(void) {
 
 static int loop(struct client *c, int sfd) {
 	for (;;) {
+		if (c->ch.done) {
+			if (on_monitor(c) < 0)
+				return c->exit_code;
+			continue;
+		}
+
 		uint64_t now = now_ms();
 		if (now >= c->deadline) {
 			if (on_timeout(c) < 0)
@@ -649,10 +648,11 @@ static int loop(struct client *c, int sfd) {
 		if (wait > MAX_WAIT_MS)
 			wait = MAX_WAIT_MS;
 
-		struct pollfd pfd[3] = {{.fd = dhcp_fd(c), .events = POLLIN},
+		struct pollfd pfd[4] = {{.fd = dhcp_fd(c), .events = POLLIN},
 		                        {.fd = sfd, .events = POLLIN},
-		                        {.fd = c->linkfd, .events = POLLIN}};
-		if (poll(pfd, 3, (int)wait) < 0) {
+		                        {.fd = c->linkfd, .events = POLLIN},
+		                        {.fd = c->ch.fd, .events = POLLIN}};
+		if (poll(pfd, 4, (int)wait) < 0) {
 			if (errno == EINTR)
 				continue;
 			perror("poll error");
@@ -665,9 +665,6 @@ static int loop(struct client *c, int sfd) {
 				return 0;
 			int r;
 			switch (si.ssi_signo) {
-			case SIGCHLD:
-				r = on_child(c);
-				break;
 			case SIGUSR2:
 				r = on_conflict(c);
 				break;
@@ -683,12 +680,17 @@ static int loop(struct client *c, int sfd) {
 				return c->exit_code;
 			continue;
 		}
+		if (pfd[3].revents) {
+			if (on_monitor(c) < 0)
+				return c->exit_code;
+			continue;
+		}
 		if (pfd[2].revents & POLLIN) {
 			if (on_link(c) < 0)
 				return c->exit_code;
 			continue;
 		}
-		if (pfd[0].revents & POLLIN) {
+		if (pfd[0].revents & (POLLIN | POLLERR)) {
 			if (on_packet(c) < 0)
 				return c->exit_code;
 		}
@@ -702,12 +704,66 @@ static void load_lease(struct client *c) {
 	if (lease_load(c->lease_path, &c->lease, &lt) < 0)
 		return;
 	if (now_ms() >= lt.expiry_at) {
-		forget_lease(c);
+		memset(&c->lease, 0, sizeof(c->lease));
+		lease_remove(c->lease_path);
 		return;
 	}
 	c->lt = lt;
 	c->applied = -1;
 	printf("previous lease %s found\n", ip_str(c->lease.yiaddr, a));
+}
+
+static void close_sockets(struct client *c) {
+	rawsock_close(&c->rs);
+	udpsock_close(&c->us);
+	if (c->linkfd >= 0)
+		close(c->linkfd);
+	c->linkfd = -1;
+}
+
+static int work(struct client *c, int sfd, pid_t monitor) {
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != monitor)
+		return 1;
+	if (sandbox_worker() < 0)
+		return 1;
+	if (link_request(c->linkfd, c->rs.ifindex) < 0)
+		return 1;
+	return loop(c, sfd);
+}
+
+static int split(struct client *c, int sfd) {
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0) {
+		perror("socketpair error");
+		return 1;
+	}
+
+	struct mon_held held = {c->applied != 0, c->lease.yiaddr, c->lease.mask,
+	                        c->lease.router};
+	pid_t monitor = getpid();
+	fflush(stdout);
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		perror("fork error");
+		close(sv[0]);
+		close(sv[1]);
+		return 1;
+	}
+	if (pid == 0) {
+		close(sv[0]);
+		c->ch.fd = sv[1];
+		int ret = work(c, sfd, monitor);
+		close(sv[1]);
+		return ret;
+	}
+
+	close(sv[1]);
+	close_sockets(c);
+	int ret =
+	    monitor_run(c->ifname, &c->ap, c->lease_path, &held, sv[0], sfd, pid);
+	close(sv[0]);
+	return ret;
 }
 
 int client_run(const char *ifname, const struct apply_opts *ap,
@@ -721,8 +777,10 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 	c.probe = probe;
 	c.secs_override = secs_override;
 	c.exit_code = 1;
+	c.rs.fd = -1;
 	c.us.fd = -1;
-	c.probe_out = -1;
+	c.linkfd = -1;
+	c.ch.fd = -1;
 	c.carrier = -1;
 	c.retry_ms = BACKOFF_START_MS;
 	if (lease_path(c.lease_path, sizeof(c.lease_path), ifname, lease_key) < 0)
@@ -733,20 +791,17 @@ int client_run(const char *ifname, const struct apply_opts *ap,
 		return 1;
 
 	int ret = 1;
-	if (rawsock_open(&c.rs, ifname) == 0) {
-		c.linkfd = link_open();
-		if (c.linkfd >= 0) {
-			wait_carrier(&c);
-			load_lease(&c);
-			if (link_request(c.linkfd, c.rs.ifindex) == 0)
-				ret = loop(&c, sfd);
-			close(c.linkfd);
-		}
+	if (rawsock_open(&c.rs, ifname) == 0 && udpsock_open(&c.us, ifname) == 0 &&
+	    (c.linkfd = link_open()) >= 0 && sandbox_monitor() == 0) {
+		rawsock_pause(&c.rs);
+		udpsock_pause(&c.us);
+		c.state = WAITING;
+		c.deadline = UINT64_MAX;
+		load_lease(&c);
+		ret = split(&c, sfd);
 	}
 
-	stop_probe(&c);
-	rawsock_close(&c.rs);
-	udpsock_close(&c.us);
+	close_sockets(&c);
 	close(sfd);
 	return ret;
 }

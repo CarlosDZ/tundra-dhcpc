@@ -29,11 +29,52 @@ it runs until it is told to stop.
 ## Requirements
 
 - Linux (uses `AF_PACKET`, `NETLINK_ROUTE`, `signalfd`, `CLOCK_BOOTTIME`).
-- Root (raw sockets and address configuration).
-- `tundra-ip` 1.7_1 or later, at the path fixed at build time (`TUNDRA_IP_PATH`,
+- `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE`: root, or the file capabilities
+  described in [Privileges](#privileges).
+- `tundra-ip` 1.8_0 or later, at the path fixed at build time (`TUNDRA_IP_PATH`,
   `/usr/bin/tundra-ip` by default).
-- `tundra-blueice-arp` 0.1_0 or later, at the path fixed at build time
+- `tundra-blueice-arp` 0.2_0 or later, at the path fixed at build time
   (`TUNDRA_BLUEICE_ARP_PATH`, `/usr/bin/tundra-blueice-arp` by default).
+- Linked against `libseccomp`.
+
+## Privileges
+
+The package marks the binary with
+`setcap cap_net_raw,cap_net_bind_service+ei` from the xbps `INSTALL` script at
+the root of this repository (`make install` does not run it): only a parent
+that already holds both capabilities as inheritable (tundra-networkd) gets them
+on exec. Any other user gets nothing and the sockets fail. Run by root it works
+without the file capabilities.
+
+After checking its arguments the client opens every socket it will ever use
+(packet, UDP port 68, link netlink), drops its permitted, effective and ambient
+capabilities, keeps only `CAP_NET_ADMIN` and `CAP_NET_RAW` as inheritable and
+splits in two processes. Run by root the monitor keeps its capabilities (the
+tools it runs would regain them on exec anyway); the worker is confined always:
+
+| Process | Does | Holds |
+|---------|------|-------|
+| Monitor (the PID that was launched) | Runs `tundra-ip` and `tundra-blueice-arp probe`, writes the lease file, forwards signals and exits with the worker's status | No usable capability; `CAP_NET_ADMIN` and `CAP_NET_RAW` as inheritable, so `tundra-ip` and the probe get theirs. No seccomp: it has to `exec` |
+| Worker (its child) | Speaks DHCP and runs the state machine | No capability in any set, `no_new_privs` and a seccomp filter. Any system call outside the filter kills it |
+
+The worker asks the monitor for every change through fixed-size messages. The
+monitor takes the interface, table, metric and priority from its own command
+line, never from the worker, checks every field and only refreshes or removes
+the configuration it applied itself.
+
+Neither process outlives the other: a dead worker stops the monitor with `1`,
+and the kernel kills the worker when the monitor dies.
+
+The kernel clears the parent death signal when a binary with file capabilities
+is executed, so the client arms it itself:
+
+| `TUNDRA_PARENT_PID` | Effect |
+|---------------------|--------|
+| The PID of the parent | SIGTERM when the parent dies |
+| Another PID (the parent died before the exec) | Ends at once with SIGTERM |
+| Unset or not a PID above 1 | Nothing, silently |
+
+The tools the client runs receive its own PID in that variable.
 
 ## Usage
 
@@ -143,7 +184,7 @@ The probe's stdout goes to the client; its stderr is the client's own.
 | Code | Meaning |
 |------|---------|
 | `0` | Stopped by SIGTERM or SIGINT (address and lease file kept, the next start resumes with INIT-REBOOT), or released by SIGUSR1 |
-| `1` | Operational failure: interface removed, socket error, `tundra-ip` could not be run, or SIGUSR1 could not remove what was applied |
+| `1` | Operational failure: interface removed, socket error, `tundra-ip` could not be run, SIGUSR1 could not remove what was applied, or the worker died |
 | `2` | Invalid usage or configuration: bad arguments, invalid table, or `tundra-ip` rejected the configuration (its own exit status 2). Never retried |
 | `111` | Alert from `tundra-blueice-arp probe`, propagated (see [Address probing](#address-probing)) |
 
@@ -173,7 +214,8 @@ make install PREFIX=/usr DESTDIR=<staging>
 `TUNDRA_IP_PATH` and `TUNDRA_BLUEICE_ARP_PATH` set where `tundra-ip` and
 `tundra-blueice-arp` are looked up
 (`make TUNDRA_IP_PATH=/usr/local/bin/tundra-ip`). The Makefile honours the
-packager's `CPPFLAGS`, `CFLAGS` and `LDFLAGS`.
+packager's `CPPFLAGS`, `CFLAGS` and `LDFLAGS`. It needs the `libseccomp`
+headers.
 
 ## Tests
 
@@ -194,8 +236,13 @@ make check
   unless a scenario asks for something else. `t-sensor.sh` runs against the real
   sensor: `BIARP_REAL`, or `../tundra-blueice-arp/build/test/tundra-blueice-arp`
   when it exists; otherwise it is skipped.
+- `t-priv.sh` checks the confinement of both processes and runs the client as
+  an unprivileged user with copies of the client, of `tundra-ip` and of the real
+  sensor (when it exists) marked with file capabilities in `build/test/priv`.
+  It needs `capsh` and `setcap`, and a build directory that is not mounted
+  `nosuid`; otherwise that part is skipped.
 - The test binary is built with protocol timers divided by 6, so a full run
-  takes about four minutes.
+  takes about five minutes.
 
 ## Known limitations
 
@@ -214,4 +261,3 @@ Planned or pending design decisions:
 - Options 12 (hostname) and 61 (client identifier).
 - DHCPRELEASE on exit and structured logging.
 - Waiting for a removed interface to come back.
-- Dropping privileges to `CAP_NET_RAW` + `CAP_NET_ADMIN`.

@@ -15,6 +15,7 @@
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
 #define UDP_MAX_PAYLOAD (1500 - 20 - 8)
+#define FLUSH_MAX 4096
 
 struct ipv4_hdr {
 	uint8_t ver_ihl;
@@ -140,8 +141,31 @@ static int attach_filter(int fd) {
 	return 0;
 }
 
+static int read_mac(struct rawsock *rs, const char *ifname) {
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	if (ioctl(rs->fd, SIOCGIFHWADDR, &ifr) < 0) {
+		perror("SIOCGIFHWADDR error");
+		return -1;
+	}
+	memcpy(rs->mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
+/* Also consumes a pending socket error, such as the ENETDOWN left by an
+ * interface that went down. Bounded so a flood cannot hold the caller. */
+void sock_flush(int fd) {
+	char b;
+	for (int i = 0; i < FLUSH_MAX; i++)
+		if (recv(fd, &b, sizeof(b), MSG_DONTWAIT | MSG_TRUNC) < 0 &&
+		    (errno == EAGAIN || errno == EWOULDBLOCK))
+			break;
+}
+
 int rawsock_open(struct rawsock *rs, const char *ifname) {
 	rs->fd = -1;
+	rs->live = 0;
 
 	unsigned int idx = if_nametoindex(ifname);
 	if (!idx) {
@@ -178,15 +202,11 @@ int rawsock_open(struct rawsock *rs, const char *ifname) {
 		return -1;
 	}
 
-	struct ifreq ifr;
-	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-	if (ioctl(rs->fd, SIOCGIFHWADDR, &ifr) < 0) {
-		perror("SIOCGIFHWADDR error");
+	if (read_mac(rs, ifname) < 0) {
 		rawsock_close(rs);
 		return -1;
 	}
-	memcpy(rs->mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	rs->live = 1;
 	return 0;
 }
 
@@ -195,6 +215,19 @@ void rawsock_close(struct rawsock *rs) {
 		close(rs->fd);
 		rs->fd = -1;
 	}
+	rs->live = 0;
+}
+
+void rawsock_pause(struct rawsock *rs) { rs->live = 0; }
+
+int rawsock_resume(struct rawsock *rs, const char *ifname) {
+	if (rs->live)
+		return 0;
+	sock_flush(rs->fd);
+	if (read_mac(rs, ifname) < 0)
+		return -1;
+	rs->live = 1;
+	return 0;
 }
 
 int rawsock_send(const struct rawsock *rs, const void *payload, size_t len) {
@@ -269,7 +302,7 @@ int rawsock_recv(const struct rawsock *rs, uint8_t *buf, size_t cap,
 
 	ssize_t n = recvmsg(rs->fd, &mh, 0);
 	if (n < 0) {
-		if (errno == EINTR)
+		if (errno == EINTR || errno == ENETDOWN)
 			return 0;
 		perror("recvmsg error");
 		return -1;

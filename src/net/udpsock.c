@@ -1,4 +1,5 @@
 #include "udpsock.h"
+#include "rawsock.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -13,6 +14,7 @@
 #define DHCP_CLIENT_PORT 68
 
 int udpsock_open(struct udpsock *us, const char *ifname) {
+	us->live = 0;
 	us->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (us->fd < 0) {
 		perror("socket(AF_INET) error");
@@ -43,6 +45,7 @@ int udpsock_open(struct udpsock *us, const char *ifname) {
 		udpsock_close(us);
 		return -1;
 	}
+	us->live = 1;
 	return 0;
 }
 
@@ -51,6 +54,16 @@ void udpsock_close(struct udpsock *us) {
 		close(us->fd);
 		us->fd = -1;
 	}
+	us->live = 0;
+}
+
+void udpsock_pause(struct udpsock *us) { us->live = 0; }
+
+void udpsock_resume(struct udpsock *us) {
+	if (us->live)
+		return;
+	sock_flush(us->fd);
+	us->live = 1;
 }
 
 int udpsock_send(const struct udpsock *us, uint32_t dst, const void *payload,

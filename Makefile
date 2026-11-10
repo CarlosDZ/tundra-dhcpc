@@ -13,6 +13,7 @@ TUNDRA_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)\" \
               -DTUNDRA_BLUEICE_ARP_PATH=\"$(TUNDRA_BLUEICE_ARP_PATH)\" \
               -DTUNDRA_DHCPC_TIME_SCALE=$(TUNDRA_DHCPC_TIME_SCALE)
 TUNDRA_INC  = -Isrc -Isrc/net -Isrc/dhcp
+TUNDRA_LIBS = -lseccomp
 
 CFLAGS ?= -Wall -Wextra -O2
 
@@ -25,7 +26,7 @@ OBJS = $(SRCS:src/%.c=$(BUILD)/%.o)
 DEPS = $(OBJS:.o=.d)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(TUNDRA_LIBS)
 
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
@@ -51,7 +52,7 @@ TEST_DEFS = -D_GNU_SOURCE -DTUNDRA_DHCPC_VERSION=\"$(VERSION)-test\" \
 
 $(TEST_BIN): FORCE
 	@mkdir -p $(dir $@)
-	$(CC) $(TUNDRA_STD) $(CFLAGS) $(TUNDRA_INC) $(TEST_DEFS) -o $@ $(SRCS)
+	$(CC) $(TUNDRA_STD) $(CFLAGS) $(TUNDRA_INC) $(TEST_DEFS) -o $@ $(SRCS) $(TUNDRA_LIBS)
 
 $(TEST_BUILD)/tools/%: tests/tools/%.c
 	@mkdir -p $(dir $@)

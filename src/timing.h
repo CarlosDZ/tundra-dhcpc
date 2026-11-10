@@ -4,6 +4,7 @@
 #include "dhcp.h"
 #include "lease.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define BACKOFF_START_MS 4000
@@ -16,6 +17,7 @@
 
 uint64_t now_ms(void);
 uint64_t scaled_ms(uint64_t secs);
+int random_bytes(void *buf, size_t len);
 uint64_t random_ms(uint64_t min, uint64_t max);
 uint64_t backoff_next(uint64_t *backoff, uint64_t now);
 uint64_t retry_before(uint64_t now, uint64_t limit);
