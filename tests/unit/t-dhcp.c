@@ -46,6 +46,53 @@ static void test_build(void) {
 	      "renew sets ciaddr and no options 50/54");
 }
 
+/* The options a server or a listener can tell this host by: hostname (12),
+ * vendor class (60), client identifier (61), user class (77), FQDN (81). */
+static int anonymous(const uint8_t b[DHCP_MSG_LEN]) {
+	static const uint8_t allowed[] = {OPT_REQUESTED_IP, OPT_MSG_TYPE,
+	                                  OPT_SERVER_ID, OPT_PARAM_REQ};
+	for (size_t i = 44; i < 236; i++)
+		if (b[i])
+			return 0;
+	size_t i = 240;
+	while (i < DHCP_MSG_LEN && b[i] != OPT_END) {
+		if (!memchr(allowed, b[i], sizeof(allowed)) || i + 1 >= DHCP_MSG_LEN)
+			return 0;
+		if (b[i] == OPT_PARAM_REQ)
+			for (size_t k = 0; k < b[i + 1]; k++)
+				if (!memchr(param_req, b[i + 2 + k], sizeof(param_req)))
+					return 0;
+		i += 2 + (size_t)b[i + 1];
+	}
+	for (i++; i < DHCP_MSG_LEN; i++)
+		if (b[i])
+			return 0;
+	return 1;
+}
+
+static void test_traceability(void) {
+	uint8_t b[DHCP_MSG_LEN];
+	uint32_t addr = inet_addr("10.0.0.5"), srv = inet_addr("10.0.0.1");
+
+	dhcp_build_discover(b, htonl(XID), 7, mac);
+	CHECK(anonymous(b), "discover identifies the host only by chaddr");
+	dhcp_build_request(b, htonl(XID), 0, mac, addr, srv);
+	CHECK(anonymous(b), "request identifies the host only by chaddr");
+	dhcp_build_request(b, htonl(XID), 0, mac, addr, 0);
+	CHECK(anonymous(b), "init-reboot request too");
+	dhcp_build_decline(b, htonl(XID), mac, addr, srv);
+	CHECK(anonymous(b), "decline too");
+	dhcp_build_renew(b, htonl(XID), 3, mac, addr);
+	CHECK(anonymous(b), "renew too");
+
+	dhcp_build_discover(b, htonl(XID), 7, mac);
+	b[243] = 12;
+	CHECK(!anonymous(b), "a hostname option is caught");
+	dhcp_build_discover(b, htonl(XID), 7, mac);
+	b[50] = 't';
+	CHECK(!anonymous(b), "a server name is caught");
+}
+
 static void test_parse(void) {
 	uint8_t b[DHCP_MSG_LEN];
 	struct dhcp_info i;
@@ -151,6 +198,7 @@ static void test_dns(void) {
 
 int main(void) {
 	test_build();
+	test_traceability();
 	test_parse();
 	test_overload();
 	test_dns();

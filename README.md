@@ -169,6 +169,14 @@ its loop, and acts on the result:
 
 The probe's stdout goes to the client; its stderr is the client's own.
 
+### Traceability
+
+The only thing a message tells about this host is the MAC of the interface
+(`chaddr`). No hostname (option 12), vendor class (60), client identifier (61),
+user class (77) or FQDN (81) is ever sent, and the server name and boot file
+fields go empty. The parameter request list asks only for the subnet mask, the
+router and the DNS servers. A unit test checks every message built.
+
 ### Robustness
 
 - Received datagrams are filtered in the kernel with a BPF program (IPv4, UDP,
@@ -258,6 +266,5 @@ Planned or pending design decisions:
 - IPv6 (DHCPv6, SLAAC).
 - Applying DNS servers (up to three are stored in the lease); only the first
   router is kept.
-- Options 12 (hostname) and 61 (client identifier).
 - DHCPRELEASE on exit and structured logging.
 - Waiting for a removed interface to come back.
