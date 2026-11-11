@@ -134,6 +134,11 @@ The current lease is stored in `/run/tundra/dhcpc/<interface>.lease` (or
 machine. On start a valid stored lease is confirmed with INIT-REBOOT instead of
 a full discovery.
 
+The file records the MAC the lease was given to (`mac=`). A lease of another
+MAC is never reused: asking for its address would tie both MACs together. It is
+forgotten, its address is taken off the interface if it is still there, and
+the client starts from discovery.
+
 ### Address lifetimes
 
 Addresses are applied with `valid` and `preferred` lifetimes equal to the
@@ -175,7 +180,9 @@ The only thing a message tells about this host is the MAC of the interface
 (`chaddr`). No hostname (option 12), vendor class (60), client identifier (61),
 user class (77) or FQDN (81) is ever sent, and the server name and boot file
 fields go empty. The parameter request list asks only for the subnet mask, the
-router and the DNS servers. A unit test checks every message built.
+router and the DNS servers. A unit test checks every message built. After a
+change of MAC, nothing of the previous one is sent either (see
+[Lease persistence](#lease-persistence)).
 
 ### Robustness
 

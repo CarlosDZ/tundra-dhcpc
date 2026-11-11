@@ -19,6 +19,20 @@ expect_log "bound to $NET." 15 "address removed while stopped is reapplied"
 eventually "address present again" 3 has_addr
 stop_client
 
+check "the lease file names the MAC it belongs to" grep -qx "mac=$(in_ns cat /sys/class/net/$IF/address)" "$LEASES/$IF.lease"
+in_ns ip link set "$IF" down
+in_ns ip link set "$IF" address 02:12:34:56:78:9a
+in_ns ip link set "$IF" up
+start_client metric 200
+expect_log "previous lease $NET.* belongs to another mac, forgotten" 3 "a lease of another MAC is not reused"
+expect_log "DHCPDISCOVER" 5 "the new MAC starts from discovery"
+check "without asking for the address of the old one" sh -c "! grep -q 'requesting previous address' '$LOG'"
+expect_log "bound to $NET." 15 "and gets its own lease"
+check "now stored under the new MAC" grep -qx "mac=02:12:34:56:78:9a" "$LEASES/$IF.lease"
+check "the old address is taken off the interface" sh -c "[ \"\$(ip netns exec $NS ip -4 -o addr show dev $IF | wc -l)\" -eq 1 ]"
+check "quietly" sh -c "! grep -q 'tundra-ip exited' '$LOG'"
+stop_client
+
 printf 'address=garbage\n' >"$LEASES/$IF.lease"
 start_client metric 200
 expect_log "ignoring invalid lease file" 3 "corrupt lease file ignored"

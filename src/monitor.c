@@ -22,6 +22,10 @@ struct monitor {
 	struct mon_held held;
 	pid_t probe_pid;
 	int probe_out;
+	const unsigned char *mac;
+	/* What is held comes from a stored lease: it may not be on the
+	 * interface any more. */
+	int unsure;
 };
 
 static void stop_probe(struct monitor *m) {
@@ -85,6 +89,7 @@ static int execute(struct monitor *m, const struct mon_req *r) {
 	switch (r->type) {
 	case MON_APPLY:
 		m->held.set = 1;
+		m->unsure = 0;
 		m->held.yiaddr = r->yiaddr;
 		m->held.mask = r->mask;
 		m->held.router = r->router;
@@ -93,7 +98,7 @@ static int execute(struct monitor *m, const struct mon_req *r) {
 		return apply_refresh(m->ifname, &info, m->ap, r->lifetime);
 	case MON_REMOVE:
 		m->held.set = 0;
-		return apply_remove(m->ifname, &info, m->ap);
+		return apply_remove(m->ifname, &info, m->ap, m->unsure);
 	case MON_REMOVE_RULE:
 		return apply_remove_rule(&info, m->ap);
 	case MON_PROBE_START:
@@ -108,7 +113,7 @@ static int execute(struct monitor *m, const struct mon_req *r) {
 		lt.t1_at = r->t1_at;
 		lt.t2_at = r->t2_at;
 		lt.expiry_at = r->expiry_at;
-		return lease_save(m->lease_path, &info, &lt);
+		return lease_save(m->lease_path, &info, &lt, m->mac);
 	case MON_LEASE_REMOVE:
 		lease_remove(m->lease_path);
 		return 0;
@@ -165,9 +170,11 @@ static int probe_done(struct monitor *m) {
 }
 
 int monitor_run(const char *ifname, const struct apply_opts *ap,
-                const char *lease_path, const struct mon_held *held, int fd,
-                int sfd, pid_t worker) {
-	struct monitor m = {ifname, ap, lease_path, fd, worker, *held, 0, -1};
+                const char *lease_path, const struct mon_held *held,
+                const unsigned char mac[ETH_ALEN], int fd, int sfd,
+                pid_t worker) {
+	struct monitor m = {ifname, ap, lease_path, fd,  worker,
+	                    *held,  0,  -1,         mac, held->set};
 
 	for (;;) {
 		struct pollfd pfd[2] = {{.fd = sfd, .events = POLLIN},

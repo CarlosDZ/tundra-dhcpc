@@ -57,6 +57,7 @@ struct client {
 	int probing;
 	int carrier;
 	int applied;
+	int stale;
 	enum state state;
 	uint32_t xid;
 	int tries;
@@ -701,8 +702,18 @@ static void load_lease(struct client *c) {
 	char a[INET_ADDRSTRLEN];
 	struct lease_times lt;
 
-	if (lease_load(c->lease_path, &c->lease, &lt) < 0)
+	unsigned char mac[ETH_ALEN];
+	if (lease_load(c->lease_path, &c->lease, &lt, mac) < 0)
 		return;
+	/* Asking for the address another MAC had would tie both together. The
+	 * worker takes it off the interface, if it is still there. */
+	if (memcmp(mac, c->rs.mac, ETH_ALEN) != 0) {
+		printf("previous lease %s belongs to another mac, forgotten\n",
+		       ip_str(c->lease.yiaddr, a));
+		c->applied = -1;
+		c->stale = 1;
+		return;
+	}
 	if (now_ms() >= lt.expiry_at) {
 		memset(&c->lease, 0, sizeof(c->lease));
 		lease_remove(c->lease_path);
@@ -728,6 +739,11 @@ static int work(struct client *c, int sfd, pid_t monitor) {
 		return 1;
 	if (link_request(c->linkfd, c->rs.ifindex) < 0)
 		return 1;
+	if (c->stale) {
+		drop_address(c);
+		forget_lease(c);
+		c->stale = 0;
+	}
 	return loop(c, sfd);
 }
 
@@ -760,8 +776,8 @@ static int split(struct client *c, int sfd) {
 
 	close(sv[1]);
 	close_sockets(c);
-	int ret =
-	    monitor_run(c->ifname, &c->ap, c->lease_path, &held, sv[0], sfd, pid);
+	int ret = monitor_run(c->ifname, &c->ap, c->lease_path, &held, c->rs.mac,
+	                      sv[0], sfd, pid);
 	close(sv[0]);
 	return ret;
 }

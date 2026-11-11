@@ -9,14 +9,28 @@
 
 static char path[] = "/tmp/tdc-lease.XXXXXX";
 
-static int load(const char *content, struct dhcp_info *i,
-                struct lease_times *lt) {
+static unsigned char got[ETH_ALEN];
+
+static int load_raw(const char *content, struct dhcp_info *i,
+                    struct lease_times *lt) {
 	FILE *f = fopen(path, "w");
 	if (!f)
 		return -2;
 	fputs(content, f);
 	fclose(f);
-	return lease_load(path, i, lt);
+	memset(got, 0, sizeof(got));
+	return lease_load(path, i, lt, got);
+}
+
+/* Every lease carries the MAC it was given to; the cases below are about
+ * the other fields. */
+static int load(const char *content, struct dhcp_info *i,
+                struct lease_times *lt) {
+	char buf[512];
+	size_t n = strlen(content);
+	snprintf(buf, sizeof(buf), "%s%s", content,
+	         n && content[n - 1] == '\n' ? "mac=52:54:00:ba:5b:e3\n" : "");
+	return load_raw(buf, i, lt);
 }
 
 int main(void) {
@@ -85,6 +99,22 @@ int main(void) {
 	           &i, &lt) < 0,
 	      "rejects a malformed DNS server");
 
+	static const unsigned char mac[ETH_ALEN] = {0x52, 0x54, 0x00,
+	                                            0xba, 0x5b, 0xe3};
+	CHECK(load(valid, &i, &lt) == 0 && memcmp(got, mac, ETH_ALEN) == 0,
+	      "the lease gives back the MAC it belongs to");
+	CHECK(load_raw(valid, &i, &lt) < 0 && i.yiaddr == 0,
+	      "a lease without MAC is not used");
+	CHECK(load_raw("address=10.0.0.5\nmask=255.255.255.0\nserver=10.0.0.1\n"
+	               "lease=60\nt1_at=1\nt2_at=2\nexpiry_at=3\n"
+	               "mac=52:54:00:ba:5b\n",
+	               &i, &lt) < 0 &&
+	          load_raw("address=10.0.0.5\nmask=255.255.255.0\n"
+	                   "server=10.0.0.1\nlease=60\nt1_at=1\nt2_at=2\n"
+	                   "expiry_at=3\nmac=52:54:00:ba:5b:zz\n",
+	                   &i, &lt) < 0,
+	      "rejects a short or malformed MAC");
+
 	char *out = NULL;
 	size_t outlen = 0;
 	FILE *m = open_memstream(&out, &outlen);
@@ -104,7 +134,7 @@ int main(void) {
 	free(out);
 
 	unlink(path);
-	CHECK(lease_load(path, &i, &lt) < 0, "a missing file is not a lease");
+	CHECK(lease_load(path, &i, &lt, got) < 0, "a missing file is not a lease");
 
 	return test_summary();
 }

@@ -1,6 +1,6 @@
 # Template file for 'tundra-dhcpc'
 pkgname=tundra-dhcpc
-version=2.1
+version=2.2
 revision=0
 build_style=gnu-makefile
 make_check_target=check-unit
