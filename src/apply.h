@@ -21,7 +21,7 @@ int apply_lease(const char *ifname, const struct dhcp_info *info,
 int apply_refresh(const char *ifname, const struct dhcp_info *info,
                   const struct apply_opts *opts, uint32_t lifetime);
 int apply_remove(const char *ifname, const struct dhcp_info *info,
-                 const struct apply_opts *opts);
+                 const struct apply_opts *opts, int unsure);
 int apply_remove_rule(const struct dhcp_info *info,
                       const struct apply_opts *opts);
 

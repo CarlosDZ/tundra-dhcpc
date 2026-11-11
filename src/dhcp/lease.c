@@ -52,7 +52,8 @@ static void put_dns(FILE *f, const uint32_t dns[DHCP_MAX_DNS]) {
 }
 
 int lease_save(const char *path, const struct dhcp_info *info,
-               const struct lease_times *lt) {
+               const struct lease_times *lt,
+               const unsigned char mac[ETH_ALEN]) {
 	if (make_dir(RUN_DIR, 0755) < 0 || make_dir(LEASE_DIR, 0700) < 0)
 		return -1;
 
@@ -84,6 +85,8 @@ int lease_save(const char *path, const struct dhcp_info *info,
 	fprintf(f, "t1_at=%llu\n", (unsigned long long)lt->t1_at);
 	fprintf(f, "t2_at=%llu\n", (unsigned long long)lt->t2_at);
 	fprintf(f, "expiry_at=%llu\n", (unsigned long long)lt->expiry_at);
+	fprintf(f, "mac=%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2],
+	        mac[3], mac[4], mac[5]);
 
 	if (fflush(f) != 0 || fsync(fd) < 0) {
 		perror("write error");
@@ -122,6 +125,18 @@ static int parse_dns(char *s, uint32_t dns[DHCP_MAX_DNS]) {
 	return n ? 0 : -1;
 }
 
+static int parse_mac(const char *s, unsigned char mac[ETH_ALEN]) {
+	unsigned int b[ETH_ALEN];
+	char end;
+	if (strlen(s) != 3 * ETH_ALEN - 1 ||
+	    sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x%c", &b[0], &b[1], &b[2], &b[3],
+	           &b[4], &b[5], &end) != ETH_ALEN)
+		return -1;
+	for (int i = 0; i < ETH_ALEN; i++)
+		mac[i] = (unsigned char)b[i];
+	return 0;
+}
+
 static int parse_u64(const char *s, uint64_t *out) {
 	if (s[0] < '0' || s[0] > '9')
 		return -1;
@@ -136,8 +151,8 @@ static int parse_u64(const char *s, uint64_t *out) {
 	return 0;
 }
 
-int lease_load(const char *path, struct dhcp_info *info,
-               struct lease_times *lt) {
+int lease_load(const char *path, struct dhcp_info *info, struct lease_times *lt,
+               unsigned char mac[ETH_ALEN]) {
 	FILE *f = fopen(path, "re");
 	if (!f)
 		return -1;
@@ -193,6 +208,9 @@ int lease_load(const char *path, struct dhcp_info *info,
 		} else if (strcmp(line, "expiry_at") == 0) {
 			r = parse_u64(val, &lt->expiry_at);
 			seen |= 64;
+		} else if (strcmp(line, "mac") == 0) {
+			r = parse_mac(val, mac);
+			seen |= 128;
 		}
 		if (r < 0) {
 			bad = 1;
@@ -201,7 +219,7 @@ int lease_load(const char *path, struct dhcp_info *info,
 	}
 	fclose(f);
 
-	if (bad || seen != 127 || !info->yiaddr || !info->mask) {
+	if (bad || seen != 255 || !info->yiaddr || !info->mask) {
 		fprintf(stderr, "ignoring invalid lease file %s\n", path);
 		memset(info, 0, sizeof(*info));
 		return -1;

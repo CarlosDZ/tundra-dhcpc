@@ -227,7 +227,7 @@ int apply_lease(const char *ifname, const struct dhcp_info *info,
 		return r;
 	r = apply_routes(ifname, info, opts, &a);
 	if (r < 0) {
-		apply_remove(ifname, info, opts);
+		apply_remove(ifname, info, opts, 0);
 		return r;
 	}
 	return 0;
@@ -242,7 +242,7 @@ int apply_refresh(const char *ifname, const struct dhcp_info *info,
 }
 
 int apply_remove(const char *ifname, const struct dhcp_info *info,
-                 const struct apply_opts *opts) {
+                 const struct apply_opts *opts, int unsure) {
 	struct addrs a;
 	if (format_addrs(info, opts, &a) < 0)
 		return APPLY_FAIL;
@@ -265,7 +265,9 @@ int apply_remove(const char *ifname, const struct dhcp_info *info,
 	cmd_init(&c, "addr", "del");
 	cmd_add(&c, a.cidr);
 	cmd_pair(&c, "on", ifname);
-	int addr = run(&c, 0);
+	int addr = run(&c, unsure);
+	if (unsure)
+		return 0;
 	return rule < 0 || addr < 0 ? APPLY_FAIL : 0;
 }
 
