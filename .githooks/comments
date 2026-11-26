@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+import os
+import re
+import subprocess
+import sys
+import tokenize
+import io
+
+ALLOWED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "comments-allowed")
+
+
+def allowed_patterns():
+    try:
+        with open(ALLOWED_FILE) as f:
+            return [re.compile(l.rstrip("\n")) for l in f if l.strip()]
+    except OSError:
+        return []
+
+
+def kind_of(path, text):
+    name = os.path.basename(path)
+    first = text.split("\n", 1)[0]
+    if name.endswith((".c", ".h")):
+        return "c"
+    if name.endswith(".py") or (first.startswith("#!") and "python" in first):
+        return "python"
+    if name == "Makefile" or name.endswith(".mk"):
+        return "make"
+    if (name.endswith(".sh") or name == "template" or
+            (first.startswith("#!") and re.search(r"\b(ba|da)?sh\b", first))):
+        return "shell"
+    if name in (".gitignore", ".gitattributes", ".clang-format"):
+        return "hash"
+    return None
+
+
+def body_c(raw):
+    if raw.startswith("//"):
+        return raw[2:].strip()
+    inner = raw[2:-2]
+    lines = [re.sub(r"^\s*\*?\s?", "", l) for l in inner.split("\n")]
+    return " ".join(l.strip() for l in lines).strip()
+
+
+def comments_c(text):
+    i, n, out = 0, len(text), []
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append((i, j, body_c(text[i:j])))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append((i, j, body_c(text[i:j])))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def shell_lines(text, make=False):
+    lines = text.split("\n")
+    out, heredoc, quote, pos = [], None, None, 0
+    for ln, line in enumerate(lines):
+        start = pos
+        pos += len(line) + 1
+        if heredoc:
+            term, strip_tabs = heredoc
+            if (line.lstrip("\t") if strip_tabs else line) == term:
+                heredoc = None
+            continue
+        if ln == 0 and line.startswith("#!"):
+            continue
+        shellish = not make or line.startswith("\t")
+        i, prev = 0, " "
+        while i < len(line):
+            c = line[i]
+            if quote:
+                if c == "\\" and quote != "'":
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = None
+                i += 1
+                prev = c
+                continue
+            if c == "\\":
+                i += 2
+                prev = "x"
+                continue
+            if shellish and c in "'\"":
+                quote = c
+            elif c == "#" and (prev in " \t;&|()" or i == 0):
+                out.append((start + i, start + len(line), line[i + 1:].strip()))
+                break
+            elif shellish and line.startswith("<<", i) and not line.startswith(
+                    "<<<", i):
+                m = re.match(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2",
+                             line[i:])
+                if m:
+                    heredoc = (m.group(3), m.group(1) == "-")
+            prev = c
+            i += 1
+    return out
+
+
+def comments_python(text):
+    out = []
+    offsets = [0]
+    for line in text.split("\n"):
+        offsets.append(offsets[-1] + len(line) + 1)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                (r, c), (r2, c2) = tok.start, tok.end
+                if r == 1 and tok.string.startswith("#!"):
+                    continue
+                s = offsets[r - 1] + c
+                out.append((s, offsets[r2 - 1] + c2, tok.string[1:].strip()))
+    except (tokenize.TokenError, SyntaxError):
+        pass
+    return out
+
+
+def comments_hash(text):
+    out, pos = [], 0
+    for line in text.split("\n"):
+        s = line.lstrip()
+        if s.startswith("#"):
+            i = pos + len(line) - len(s)
+            out.append((i, pos + len(line), s[1:].strip()))
+        pos += len(line) + 1
+    return out
+
+
+def find(kind, text):
+    if kind == "c":
+        return comments_c(text)
+    if kind == "python":
+        return comments_python(text)
+    if kind == "shell":
+        return shell_lines(text)
+    if kind == "make":
+        return shell_lines(text, make=True)
+    if kind == "hash":
+        return comments_hash(text)
+    return []
+
+
+def is_allowed(body, patterns):
+    return any(p.search(body) for p in patterns)
+
+
+def strip(text, spans):
+    for s, e, _ in sorted(spans, reverse=True):
+        ls = text.rfind("\n", 0, s) + 1
+        le = text.find("\n", e)
+        le = len(text) if le < 0 else le
+        before, after = text[ls:s], text[e:le]
+        if not before.strip() and not after.strip():
+            text = text[:ls] + text[le + 1:]
+        elif not after.strip():
+            text = text[:s].rstrip(" \t") + text[e:]
+        else:
+            gap = " " if before[-1:] not in " \t" and after[:1] not in " \t" else ""
+            text = text[:s] + gap + text[e:]
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.lstrip("\n")
+
+
+def bad(path, text, patterns):
+    kind = kind_of(path, text)
+    return [x for x in find(kind, text) if not is_allowed(x[2], patterns)]
+
+
+def staged():
+    names = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
+        capture_output=True, check=True).stdout.decode().split("\0")
+    for name in filter(None, names):
+        blob = subprocess.run(["git", "show", ":" + name],
+                              capture_output=True).stdout
+        try:
+            yield name, blob.decode()
+        except UnicodeDecodeError:
+            continue
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("check", "strip", "staged"):
+        print("usage: comments check|strip FILE... | staged", file=sys.stderr)
+        return 2
+    patterns = allowed_patterns()
+    mode, found = sys.argv[1], 0
+    if mode == "staged":
+        files = list(staged())
+    else:
+        files = []
+        for p in sys.argv[2:]:
+            try:
+                with open(p) as f:
+                    files.append((p, f.read()))
+            except (OSError, UnicodeDecodeError):
+                continue
+    for path, text in files:
+        spans = bad(path, text, patterns)
+        if mode == "strip":
+            if spans:
+                with open(path, "w") as f:
+                    f.write(strip(text, spans))
+                print(path)
+            continue
+        for s, _, body in spans:
+            line = text.count("\n", 0, s) + 1
+            print("%s:%d: %s" % (path, line, body[:70]), file=sys.stderr)
+            found = 1
+    if found:
+        print("comments: only those of comments-allowed go in", file=sys.stderr)
+    return found
+
+
+sys.exit(main())

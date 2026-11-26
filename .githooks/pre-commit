@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+python3 .githooks/comments staged
+
 METAPKG=metapkg
 TEMPLATE=template
 
